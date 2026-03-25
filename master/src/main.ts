@@ -468,6 +468,13 @@ copyUrlBtn.addEventListener('click', () => {
   });
 });
 
+// ── Connect Button ───────────────────────────────────────────────────────────
+connectBtn.addEventListener('click', connectWebSocket);
+
+// Also connect when pressing Enter in either input field
+showIdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connectWebSocket(); });
+workerUrlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connectWebSocket(); });
+
 // ── Persist Worker URL ────────────────────────────────────────────────────────
 const savedUrl = localStorage.getItem('cinewav_worker_url');
 if (savedUrl) workerUrlInput.value = savedUrl;
