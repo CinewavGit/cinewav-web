@@ -400,6 +400,39 @@
       gap: 10px;
     }
 
+    /* Play/Pause button */
+    .btn-play-pause {
+      width: 64px;
+      height: 64px;
+      border: none;
+      border-radius: 50%;
+      background: var(--accent);
+      color: white;
+      font-size: 26px;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 20px rgba(108, 99, 255, 0.4);
+      flex-shrink: 0;
+    }
+    .btn-play-pause:active { transform: scale(0.93); }
+    .btn-play-pause:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .transport-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      width: 100%;
+      max-width: 320px;
+    }
+
+    .transport-row .btn-resync {
+      flex: 1;
+    }
+
     /* RESYNC button */
     .btn-resync {
       width: 100%;
@@ -570,10 +603,13 @@
 
       <!-- Manual Sync Controls -->
       <div class="sync-controls" id="sync-controls" style="display:none">
-        <!-- RESYNC button -->
-        <button class="btn-resync" id="resync-btn" disabled>
-          <span>&#8635;</span> Resync Now
-        </button>
+        <!-- Transport row: Play/Pause + Resync -->
+        <div class="transport-row">
+          <button class="btn-play-pause" id="play-pause-btn" disabled aria-label="Play / Pause">&#9654;</button>
+          <button class="btn-resync" id="resync-btn" disabled>
+            <span>&#8635;</span> Resync Now
+          </button>
+        </div>
 
         <!-- Fine-tune offset -->
         <div class="fine-tune-row">

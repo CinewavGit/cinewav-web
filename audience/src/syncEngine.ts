@@ -195,6 +195,11 @@ export class SyncEngine {
     return this.positionAtCommand + elapsedSec;
   }
 
+  /** Returns whether the master is currently in a playing state. */
+  getIsPlaying(): boolean {
+    return this.isPlaying;
+  }
+
   // ── Private ───────────────────────────────────────────────────────────────────
 
   /**

@@ -14,8 +14,9 @@ import { SyncEngine, ShowCommand } from './syncEngine';
 import { saveAudio, loadAudio } from './audioStorage';
 
 // ── Manual Sync DOM Elements ────────────────────────────────────────────────
-const syncControlsEl = document.getElementById('sync-controls')!;
-const resyncBtn      = document.getElementById('resync-btn') as HTMLButtonElement;
+const syncControlsEl  = document.getElementById('sync-controls')!;
+const playPauseBtn    = document.getElementById('play-pause-btn') as HTMLButtonElement;
+const resyncBtn       = document.getElementById('resync-btn') as HTMLButtonElement;
 const ftMinus        = document.getElementById('ft-minus') as HTMLButtonElement;
 const ftPlus         = document.getElementById('ft-plus') as HTMLButtonElement;
 const ftReset        = document.getElementById('ft-reset') as HTMLButtonElement;
@@ -209,6 +210,7 @@ function startPlayback(fromPosition: number) {
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
   startUILoop();
+  updatePlayPauseBtn();
 
   // Notify sync engine
   syncEngine?.notifyCommandApplied(clampedPos, true);
@@ -226,6 +228,7 @@ function stopPlayback() {
   isPlaying = false;
   albumArt.classList.remove('playing');
   stopUILoop();
+  updatePlayPauseBtn();
 }
 
 // ── Media Session API (lock screen / background audio) ───────────────────────
@@ -359,63 +362,93 @@ function handleResync(targetPosition: number, play: boolean) {
   }
 }
 
-//// ── Manual Sync Controls ─────────────────────────────────────────────────────────────
+//// ── Play/Pause Button ─────────────────────────────────────────────────────────────
+
+function updatePlayPauseBtn() {
+  playPauseBtn.innerHTML = isPlaying ? '&#9646;&#9646;' : '&#9654;';
+  playPauseBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+}
+
+playPauseBtn.addEventListener('click', async () => {
+  if (!audioCtx || !audioBuffer) return;
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+  if (isPlaying) {
+    // Pause locally — note: master controls the show, this is a local mute/pause
+    stopPlayback();
+    playPauseBtn.innerHTML = '&#9654;';
+    setSyncStatus('synced', 'Paused locally');
+  } else {
+    // Resume: sync to master position
+    const masterPos = syncEngine?.getEstimatedMasterPosition() ?? playStartPos;
+    startPlayback(masterPos);
+    playPauseBtn.innerHTML = '&#9646;&#9646;';
+    setSyncStatus('synced', 'In sync');
+  }
+});
+
+// ── Manual Sync Controls ─────────────────────────────────────────────────────────────
 
 /**
  * Perform an immediate manual resync: ask the sync engine for the current
  * master position and restart playback from there, applying the manual offset.
+ * Always resumes the AudioContext first (critical on iOS after screen lock).
  */
-function doManualResync() {
+async function doManualResync() {
   if (!syncEngine || !audioCtx || !audioBuffer) return;
+
+  // MUST resume AudioContext before any playback — it may be suspended on iOS
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
 
   const masterPos = syncEngine.getEstimatedMasterPosition();
   if (masterPos === null) return;
 
-  const wasPlaying = isPlaying;
+  // Capture isPlaying BEFORE stopPlayback() sets it to false
+  const masterIsPlaying = syncEngine.getIsPlaying();
+
   stopPlayback();
-  if (wasPlaying) {
+
+  if (masterIsPlaying) {
     startPlayback(masterPos);
     setSyncStatus('synced', 'Resynced');
   } else {
+    // Master is paused — just update our position
     playStartPos = masterPos + (manualOffsetMs / 1000);
     setSyncStatus('synced', 'Paused');
   }
 }
 
 resyncBtn.addEventListener('click', () => {
-  if (audioCtx?.state === 'suspended') audioCtx.resume();
-  doManualResync();
-  // Brief visual feedback
-  resyncBtn.textContent = '✓ Synced!';
-  setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
+  doManualResync().then(() => {
+    resyncBtn.textContent = '✓ Synced!';
+    setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
+  });
 });
+
+async function applyOffsetChange() {
+  if (syncEngine?.getIsPlaying() && audioCtx && audioBuffer) {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    const masterPos = syncEngine.getEstimatedMasterPosition();
+    if (masterPos !== null) startPlayback(masterPos);
+  }
+}
 
 ftMinus.addEventListener('click', () => {
   manualOffsetMs -= 50;
   saveManualOffset();
-  // If currently playing, apply the new offset immediately
-  if (isPlaying && syncEngine) {
-    const masterPos = syncEngine.getEstimatedMasterPosition();
-    if (masterPos !== null) startPlayback(masterPos);
-  }
+  applyOffsetChange();
 });
 
 ftPlus.addEventListener('click', () => {
   manualOffsetMs += 50;
   saveManualOffset();
-  if (isPlaying && syncEngine) {
-    const masterPos = syncEngine.getEstimatedMasterPosition();
-    if (masterPos !== null) startPlayback(masterPos);
-  }
+  applyOffsetChange();
 });
 
 ftReset.addEventListener('click', () => {
   manualOffsetMs = 0;
   saveManualOffset();
-  if (isPlaying && syncEngine) {
-    const masterPos = syncEngine.getEstimatedMasterPosition();
-    if (masterPos !== null) startPlayback(masterPos);
-  }
+  applyOffsetChange();
 });
 
 // ── Join Flow ─────────────────────────────────────────────────────────────
@@ -474,6 +507,7 @@ async function joinShow() {
     syncControlsEl.style.display = 'flex';
     loadManualOffset();
     resyncBtn.disabled = false;
+    playPauseBtn.disabled = false;
 
     if (audioData) {
       await initAudio(audioData.data);
