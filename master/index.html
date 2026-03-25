@@ -41,6 +41,9 @@
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 12px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
     }
 
     .logo {
@@ -98,103 +101,249 @@
       50% { opacity: 0.3; }
     }
 
-    main {
+    /* ── Layout ── */
+    .layout {
+      display: flex;
       flex: 1;
-      padding: 24px;
-      max-width: 900px;
-      margin: 0 auto;
+      overflow: hidden;
+      height: calc(100vh - 65px);
+    }
+
+    /* ── Video Panel (left / main) ── */
+    .video-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: #000;
+      position: relative;
+      min-width: 0;
+    }
+
+    .video-drop-zone {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      border: 2px dashed var(--border);
+      margin: 24px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: border-color 0.2s;
+      color: var(--text-muted);
+      text-align: center;
+      padding: 40px;
+    }
+
+    .video-drop-zone:hover,
+    .video-drop-zone.drag-over {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .video-drop-zone .drop-icon {
+      font-size: 48px;
+    }
+
+    .video-drop-zone .drop-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .video-drop-zone .drop-sub {
+      font-size: 13px;
+    }
+
+    #video-player {
       width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: none;
+      background: #000;
+    }
+
+    .video-panel.has-video .video-drop-zone { display: none; }
+    .video-panel.has-video #video-player { display: block; }
+
+    /* Fullscreen overlay controls */
+    .video-overlay {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 16px 20px;
+      background: linear-gradient(transparent, rgba(0,0,0,0.85));
+      display: none;
+      align-items: center;
+      gap: 12px;
+      transition: opacity 0.3s;
+    }
+
+    .video-panel.has-video .video-overlay { display: flex; }
+
+    .video-overlay .play-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .video-overlay .play-btn.play {
+      background: var(--success);
+      color: #0a0a0f;
+      box-shadow: 0 0 16px rgba(46, 213, 115, 0.4);
+    }
+    .video-overlay .play-btn.pause {
+      background: var(--warning);
+      color: #0a0a0f;
+      box-shadow: 0 0 16px rgba(255, 165, 2, 0.4);
+    }
+    .video-overlay .play-btn:hover { transform: scale(1.08); }
+    .video-overlay .play-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    .seek-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .seek-bar {
+      width: 100%;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: rgba(255,255,255,0.2);
+      border-radius: 2px;
+      outline: none;
+      cursor: pointer;
+    }
+
+    .seek-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 6px rgba(108, 99, 255, 0.6);
+    }
+
+    .time-display {
+      font-size: 12px;
+      color: rgba(255,255,255,0.7);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .fullscreen-btn {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.2);
+      color: white;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      white-space: nowrap;
+      transition: background 0.2s;
+    }
+    .fullscreen-btn:hover { background: rgba(255,255,255,0.2); }
+
+    .resync-overlay-btn {
+      background: rgba(108, 99, 255, 0.3);
+      border: 1px solid var(--accent);
+      color: white;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      white-space: nowrap;
+      transition: background 0.2s;
+    }
+    .resync-overlay-btn:hover { background: rgba(108, 99, 255, 0.5); }
+
+    /* ── Control Panel (right sidebar) ── */
+    .control-panel {
+      width: 320px;
+      flex-shrink: 0;
+      overflow-y: auto;
+      background: var(--bg);
+      border-left: 1px solid var(--border);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
     }
 
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 20px;
-      margin-bottom: 20px;
+      padding: 16px;
     }
 
     .card-title {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 1px;
       color: var(--text-muted);
-      margin-bottom: 16px;
-    }
-
-    .form-row {
-      display: flex;
-      gap: 12px;
-      align-items: flex-end;
-      flex-wrap: wrap;
+      margin-bottom: 12px;
     }
 
     .form-group {
       display: flex;
       flex-direction: column;
       gap: 6px;
-      flex: 1;
-      min-width: 160px;
+      margin-bottom: 10px;
     }
 
+    .form-group:last-child { margin-bottom: 0; }
+
     label {
-      font-size: 13px;
+      font-size: 12px;
       color: var(--text-muted);
       font-weight: 500;
     }
 
-    input[type="text"], input[type="file"] {
+    input[type="text"] {
       background: var(--surface2);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 10px 14px;
+      padding: 9px 12px;
       color: var(--text);
-      font-size: 14px;
+      font-size: 13px;
       outline: none;
       transition: border-color 0.2s;
+      width: 100%;
     }
 
-    input[type="text"]:focus {
-      border-color: var(--accent);
-    }
-
-    input[type="file"] {
-      cursor: pointer;
-      padding: 8px 12px;
-    }
+    input[type="text"]:focus { border-color: var(--accent); }
 
     .btn {
-      padding: 10px 20px;
+      padding: 9px 16px;
       border: none;
       border-radius: 8px;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.2s;
       white-space: nowrap;
+      width: 100%;
+      text-align: center;
     }
 
-    .btn-primary {
-      background: var(--accent);
-      color: white;
-    }
-    .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); }
-    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
-
-    .btn-success {
-      background: var(--success);
-      color: #0a0a0f;
-    }
-    .btn-success:hover { filter: brightness(1.1); }
-    .btn-success:disabled { opacity: 0.4; cursor: not-allowed; }
-
-    .btn-danger {
-      background: var(--danger);
-      color: white;
-    }
-    .btn-danger:hover { filter: brightness(1.1); }
-    .btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
     .btn-ghost {
       background: var(--surface2);
@@ -204,124 +353,48 @@
     .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
     .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    /* Transport controls */
-    .transport {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-
-    .play-btn {
-      width: 56px;
-      height: 56px;
-      border-radius: 50%;
-      border: none;
-      cursor: pointer;
-      font-size: 22px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: all 0.2s;
-      flex-shrink: 0;
-    }
-
-    .play-btn.play {
-      background: var(--success);
-      color: #0a0a0f;
-      box-shadow: 0 0 20px rgba(46, 213, 115, 0.3);
-    }
-    .play-btn.pause {
-      background: var(--warning);
-      color: #0a0a0f;
-      box-shadow: 0 0 20px rgba(255, 165, 2, 0.3);
-    }
-    .play-btn:hover { transform: scale(1.05); }
-    .play-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
-
-    /* Seek bar */
-    .seek-container {
-      flex: 1;
-      min-width: 200px;
-    }
-
-    .seek-bar {
-      width: 100%;
-      height: 6px;
-      -webkit-appearance: none;
-      appearance: none;
-      background: var(--surface2);
-      border-radius: 3px;
-      outline: none;
-      cursor: pointer;
-    }
-
-    .seek-bar::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 16px;
-      height: 16px;
-      border-radius: 50%;
-      background: var(--accent);
-      cursor: pointer;
-      box-shadow: 0 0 6px rgba(108, 99, 255, 0.5);
-    }
-
-    .time-display {
-      font-size: 13px;
-      color: var(--text-muted);
-      font-variant-numeric: tabular-nums;
-      white-space: nowrap;
-    }
-
     /* Stats grid */
     .stats-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 12px;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
     }
 
     .stat-card {
       background: var(--surface2);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 14px;
+      padding: 10px;
       text-align: center;
     }
 
     .stat-value {
-      font-size: 28px;
+      font-size: 20px;
       font-weight: 700;
       color: var(--accent);
       font-variant-numeric: tabular-nums;
     }
 
     .stat-label {
-      font-size: 11px;
+      font-size: 10px;
       color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      margin-top: 4px;
+      margin-top: 2px;
     }
 
-    /* QR / Share section */
-    .share-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-
+    /* Share section */
     .share-url {
-      flex: 1;
-      min-width: 200px;
       background: var(--surface2);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 10px 14px;
-      font-size: 13px;
+      padding: 9px 12px;
+      font-size: 11px;
       color: var(--text-muted);
       font-family: monospace;
       word-break: break-all;
+      margin-bottom: 8px;
+      min-height: 40px;
     }
 
     /* Log */
@@ -329,11 +402,11 @@
       background: var(--surface2);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 12px;
+      padding: 10px;
       font-family: monospace;
-      font-size: 12px;
+      font-size: 11px;
       color: var(--text-muted);
-      height: 120px;
+      height: 140px;
       overflow-y: auto;
       line-height: 1.6;
     }
@@ -344,20 +417,52 @@
     .log-entry.warn { color: var(--warning); }
     .log-entry.error { color: var(--danger); }
 
-    /* Audio waveform visualizer */
-    #waveform {
-      width: 100%;
-      height: 60px;
-      background: var(--surface2);
-      border-radius: 8px;
-      margin-top: 12px;
+    /* File drop highlight on video panel */
+    .video-panel.drag-active .video-drop-zone {
+      border-color: var(--accent);
+      background: rgba(108, 99, 255, 0.05);
     }
 
-    /* Responsive */
-    @media (max-width: 600px) {
-      main { padding: 16px; }
-      .form-row { flex-direction: column; }
-      .transport { justify-content: center; }
+    /* Video file info bar */
+    .video-info-bar {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      background: rgba(108, 99, 255, 0.1);
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .video-panel.has-video .video-info-bar { display: flex; }
+
+    .video-filename {
+      font-weight: 600;
+      color: var(--text);
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .change-video-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      flex-shrink: 0;
+    }
+    .change-video-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* Responsive: stack on small screens */
+    @media (max-width: 768px) {
+      .layout { flex-direction: column; height: auto; }
+      .control-panel { width: 100%; border-left: none; border-top: 1px solid var(--border); }
+      .video-panel { min-height: 240px; }
     }
   </style>
 </head>
@@ -377,96 +482,103 @@
     </div>
   </header>
 
-  <main>
-    <!-- Show Setup -->
-    <div class="card">
-      <div class="card-title">Show Setup</div>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="show-id">Show ID</label>
-          <input type="text" id="show-id" placeholder="e.g. show-001" value="demo" />
-        </div>
-        <div class="form-group">
-          <label for="worker-url">Sync Server URL</label>
-          <input type="text" id="worker-url" placeholder="wss://cinewav-sync.your-account.workers.dev" />
-        </div>
-        <button class="btn btn-primary" id="connect-btn">Connect</button>
+  <div class="layout">
+    <!-- ── Video Panel ── -->
+    <div class="video-panel" id="video-panel">
+      <!-- Info bar shown when video is loaded -->
+      <div class="video-info-bar">
+        <span>🎬</span>
+        <span class="video-filename" id="video-filename">—</span>
+        <button class="change-video-btn" id="change-video-btn">Change</button>
       </div>
-    </div>
 
-    <!-- Audio Load -->
-    <div class="card">
-      <div class="card-title">Audio File</div>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="audio-file">Load Audio File</label>
-          <input type="file" id="audio-file" accept="audio/*" />
+      <!-- Drop zone shown before video is loaded -->
+      <div class="video-drop-zone" id="video-drop-zone">
+        <div class="drop-icon">🎬</div>
+        <div class="drop-title">Drop your video file here</div>
+        <div class="drop-sub">or click to browse — MP4, MOV, MKV, WebM supported</div>
+        <div class="drop-sub" style="margin-top:8px;font-size:11px;">
+          The video is your master clock. Extract the audio separately and distribute it to the audience.
         </div>
-        <div class="form-group">
-          <label for="audio-name">Track Name</label>
-          <input type="text" id="audio-name" placeholder="e.g. Feature Film Audio" />
-        </div>
-        <button class="btn btn-ghost" id="load-btn" disabled>Load &amp; Broadcast</button>
       </div>
-      <canvas id="waveform"></canvas>
-    </div>
 
-    <!-- Transport Controls -->
-    <div class="card">
-      <div class="card-title">Transport</div>
-      <div class="transport">
-        <button class="play-btn play" id="play-pause-btn" disabled title="Play / Pause">▶</button>
+      <!-- The actual video element -->
+      <video id="video-player" preload="auto" playsinline></video>
+
+      <!-- Overlay controls (shown when video loaded) -->
+      <div class="video-overlay" id="video-overlay">
+        <button class="play-btn play" id="play-pause-btn" disabled title="Play / Pause (Space)">▶</button>
         <div class="seek-container">
           <input type="range" class="seek-bar" id="seek-bar" min="0" max="100" value="0" step="0.1" disabled />
           <div class="time-display">
             <span id="current-time">0:00:00</span> / <span id="total-time">0:00:00</span>
           </div>
         </div>
-        <button class="btn btn-ghost" id="resync-btn" disabled title="Force resync all clients">⟳ Resync All</button>
+        <button class="resync-overlay-btn" id="resync-btn" disabled title="Force resync all audience devices">⟳ Resync</button>
+        <button class="fullscreen-btn" id="fullscreen-btn" title="Toggle fullscreen (F)">⛶ Full</button>
       </div>
     </div>
 
-    <!-- Stats -->
-    <div class="card">
-      <div class="card-title">Live Stats</div>
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-value" id="stat-listeners">0</div>
-          <div class="stat-label">Listeners</div>
+    <!-- ── Control Sidebar ── -->
+    <div class="control-panel">
+
+      <!-- Show Setup -->
+      <div class="card">
+        <div class="card-title">Show Setup</div>
+        <div class="form-group">
+          <label for="show-id">Show ID</label>
+          <input type="text" id="show-id" placeholder="e.g. show-001" value="demo" />
         </div>
-        <div class="stat-card">
-          <div class="stat-value" id="stat-position">0:00</div>
-          <div class="stat-label">Position</div>
+        <div class="form-group">
+          <label for="worker-url">Sync Server URL</label>
+          <input type="text" id="worker-url" placeholder="https://cinewav-sync.workers.dev" />
         </div>
-        <div class="stat-card">
-          <div class="stat-value" id="stat-latency">—</div>
-          <div class="stat-label">Server Latency</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-value" id="stat-state">STOPPED</div>
-          <div class="stat-label">State</div>
+        <button class="btn btn-primary" id="connect-btn">Connect</button>
+      </div>
+
+      <!-- Live Stats -->
+      <div class="card">
+        <div class="card-title">Live Stats</div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value" id="stat-listeners">0</div>
+            <div class="stat-label">Listeners</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-position">0:00</div>
+            <div class="stat-label">Position</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-latency">—</div>
+            <div class="stat-label">Latency</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-state">STOPPED</div>
+            <div class="stat-label">State</div>
+          </div>
         </div>
       </div>
-    </div>
 
-    <!-- Audience Link -->
-    <div class="card">
-      <div class="card-title">Audience Link</div>
-      <div class="share-row">
+      <!-- Audience Link -->
+      <div class="card">
+        <div class="card-title">Audience Link</div>
         <div class="share-url" id="audience-url">Connect to a show first…</div>
-        <button class="btn btn-ghost" id="copy-url-btn" disabled>Copy Link</button>
+        <button class="btn btn-ghost" id="copy-url-btn" disabled>Copy Audience Link</button>
+        <p style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
+          Share this link with your audience. They download the audio file once and sync automatically.
+        </p>
       </div>
-      <p style="font-size:12px;color:var(--text-muted);margin-top:10px;">
-        Share this link with your audience. They will download the audio file and sync automatically.
-      </p>
-    </div>
 
-    <!-- Activity Log -->
-    <div class="card">
-      <div class="card-title">Activity Log</div>
-      <div class="log" id="log"></div>
+      <!-- Activity Log -->
+      <div class="card">
+        <div class="card-title">Activity Log</div>
+        <div class="log" id="log"></div>
+      </div>
     </div>
-  </main>
+  </div>
+
+  <!-- Hidden file input for video selection -->
+  <input type="file" id="video-file-input" accept="video/*,audio/*" style="display:none" />
 
   <script type="module" src="/src/main.ts"></script>
 </body>

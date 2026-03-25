@@ -1,55 +1,53 @@
 /**
- * Cinewav Master — Main Controller
+ * Cinewav Master — Video-Driven Sync Controller
  *
- * Responsibilities:
- *  1. Connect to the Cloudflare Worker via WebSocket
- *  2. Load an audio file and play it locally via Web Audio API
- *  3. Send play/pause/seek commands to all audience devices
- *  4. Measure server latency (NTP ping/pong)
- *  5. Draw a waveform visualizer
+ * Architecture:
+ *  - The HTML5 <video> element is the master clock.
+ *  - video.currentTime is the single source of truth for position.
+ *  - Play / pause / seek events on the video are captured and
+ *    broadcast to all audience devices via WebSocket.
+ *  - The operator loads a video file (MP4, MOV, WebM, etc.).
+ *  - The audio track extracted from that same video is what the
+ *    audience downloads and plays on their devices.
  */
 
 // ── DOM Elements ─────────────────────────────────────────────────────────────
-const wsStatusEl = document.getElementById('ws-status')!;
-const wsDotEl = document.getElementById('ws-dot')!;
-const audienceCountHeaderEl = document.getElementById('audience-count-header')!;
-const showIdInput = document.getElementById('show-id') as HTMLInputElement;
-const workerUrlInput = document.getElementById('worker-url') as HTMLInputElement;
-const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
-const audioFileInput = document.getElementById('audio-file') as HTMLInputElement;
-const audioNameInput = document.getElementById('audio-name') as HTMLInputElement;
-const loadBtn = document.getElementById('load-btn') as HTMLButtonElement;
-const playPauseBtn = document.getElementById('play-pause-btn') as HTMLButtonElement;
-const seekBar = document.getElementById('seek-bar') as HTMLInputElement;
-const currentTimeEl = document.getElementById('current-time')!;
-const totalTimeEl = document.getElementById('total-time')!;
-const resyncBtn = document.getElementById('resync-btn') as HTMLButtonElement;
-const statListeners = document.getElementById('stat-listeners')!;
-const statPosition = document.getElementById('stat-position')!;
-const statLatency = document.getElementById('stat-latency')!;
-const statState = document.getElementById('stat-state')!;
-const audienceUrlEl = document.getElementById('audience-url')!;
-const copyUrlBtn = document.getElementById('copy-url-btn') as HTMLButtonElement;
-const logEl = document.getElementById('log')!;
-const waveformCanvas = document.getElementById('waveform') as HTMLCanvasElement;
+const wsStatusEl        = document.getElementById('ws-status')!;
+const wsDotEl           = document.getElementById('ws-dot')!;
+const audienceCountEl   = document.getElementById('audience-count-header')!;
+const showIdInput       = document.getElementById('show-id') as HTMLInputElement;
+const workerUrlInput    = document.getElementById('worker-url') as HTMLInputElement;
+const connectBtn        = document.getElementById('connect-btn') as HTMLButtonElement;
+const videoPanel        = document.getElementById('video-panel')!;
+const videoDropZone     = document.getElementById('video-drop-zone')!;
+const videoPlayer       = document.getElementById('video-player') as HTMLVideoElement;
+const videoFilenameEl   = document.getElementById('video-filename')!;
+const changeVideoBtn    = document.getElementById('change-video-btn') as HTMLButtonElement;
+const videoFileInput    = document.getElementById('video-file-input') as HTMLInputElement;
+const playPauseBtn      = document.getElementById('play-pause-btn') as HTMLButtonElement;
+const seekBar           = document.getElementById('seek-bar') as HTMLInputElement;
+const currentTimeEl     = document.getElementById('current-time')!;
+const totalTimeEl       = document.getElementById('total-time')!;
+const resyncBtn         = document.getElementById('resync-btn') as HTMLButtonElement;
+const fullscreenBtn     = document.getElementById('fullscreen-btn') as HTMLButtonElement;
+const statListeners     = document.getElementById('stat-listeners')!;
+const statPosition      = document.getElementById('stat-position')!;
+const statLatency       = document.getElementById('stat-latency')!;
+const statState         = document.getElementById('stat-state')!;
+const audienceUrlEl     = document.getElementById('audience-url')!;
+const copyUrlBtn        = document.getElementById('copy-url-btn') as HTMLButtonElement;
+const logEl             = document.getElementById('log')!;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let ws: WebSocket | null = null;
-let audioCtx: AudioContext | null = null;
-let audioBuffer: AudioBuffer | null = null;
-let sourceNode: AudioBufferSourceNode | null = null;
-let analyserNode: AnalyserNode | null = null;
-let isPlaying = false;
-let playStartTime = 0;    // audioCtx.currentTime when play started
-let playStartPos = 0;     // audio position (seconds) when play started
-let audioDuration = 0;
 let serverLatencyMs = 0;
 let pingInterval: ReturnType<typeof setInterval> | null = null;
 let uiInterval: ReturnType<typeof setInterval> | null = null;
-let animFrameId: number | null = null;
 let currentShowId = '';
 let currentWorkerBase = '';
 let isSeeking = false;
+let videoObjectUrl = '';
+let broadcastThrottle: ReturnType<typeof setTimeout> | null = null;
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 function log(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
@@ -59,12 +57,12 @@ function log(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info')
   entry.textContent = `[${ts}] ${msg}`;
   logEl.appendChild(entry);
   logEl.scrollTop = logEl.scrollHeight;
-  // Keep log to last 200 entries
   while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild!);
 }
 
 // ── Time Formatting ───────────────────────────────────────────────────────────
 function formatTime(seconds: number): string {
+  if (!isFinite(seconds) || isNaN(seconds)) return '0:00';
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
@@ -73,11 +71,20 @@ function formatTime(seconds: number): string {
     : `${m}:${String(s).padStart(2, '0')}`;
 }
 
-// ── WebSocket Connection ──────────────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 function setWsStatus(status: 'connecting' | 'connected' | 'disconnected' | 'error') {
-  const labels = { connecting: 'Connecting…', connected: 'Connected', disconnected: 'Disconnected', error: 'Error' };
+  const labels = {
+    connecting: 'Connecting…',
+    connected: 'Connected',
+    disconnected: 'Disconnected',
+    error: 'Error',
+  };
   wsStatusEl.textContent = labels[status];
-  wsDotEl.className = `status-dot ${status === 'connected' ? 'connected' : status === 'connecting' ? 'connecting' : status === 'error' ? 'error' : ''}`;
+  wsDotEl.className = `status-dot ${
+    status === 'connected' ? 'connected' :
+    status === 'connecting' ? 'connecting' :
+    status === 'error' ? 'error' : ''
+  }`;
 }
 
 function connectWebSocket() {
@@ -90,7 +97,6 @@ function connectWebSocket() {
   }
 
   currentShowId = showId;
-  // Convert http(s) to ws(s) if needed
   currentWorkerBase = workerBase.replace(/^http/, 'ws').replace(/\/$/, '');
   const wsUrl = `${currentWorkerBase}/api/show/${showId}/ws`;
 
@@ -107,25 +113,20 @@ function connectWebSocket() {
     log('WebSocket connected', 'success');
     connectBtn.textContent = 'Reconnect';
     connectBtn.disabled = false;
-    loadBtn.disabled = false;
 
-    // Join as master
     ws!.send(JSON.stringify({ type: 'join', role: 'master', clientId: `master-${Date.now()}` }));
-
-    // Start NTP ping loop
     startPingLoop();
 
-    // Update audience link
+    // Build audience URL
     const httpBase = workerBase.replace(/^ws/, 'http').replace(/\/$/, '');
-    const audienceUrl = `${window.location.origin.replace('5173', '5174')}?show=${showId}&server=${encodeURIComponent(httpBase)}`;
+    const audienceUrl = `https://cinewav-audience.pages.dev?show=${showId}&server=${encodeURIComponent(httpBase)}`;
     audienceUrlEl.textContent = audienceUrl;
     copyUrlBtn.disabled = false;
 
-    // Enable controls if audio is loaded
-    if (audioBuffer) {
-      playPauseBtn.disabled = false;
-      seekBar.disabled = false;
-      resyncBtn.disabled = false;
+    // If video is already loaded, broadcast its state
+    if (videoPlayer.readyState >= 1) {
+      broadcastLoad();
+      updateTransportEnabled(true);
     }
   };
 
@@ -156,23 +157,16 @@ function handleServerMessage(msg: Record<string, unknown>) {
   switch (msg.type) {
     case 'pong': {
       const clientTs = msg.clientTs as number;
-      const serverTs = msg.serverTs as number;
       const now = Date.now();
       const rtt = now - clientTs;
       serverLatencyMs = rtt / 2;
       statLatency.textContent = `${Math.round(serverLatencyMs)}ms`;
-      // Optionally: compute clock offset = serverTs - (clientTs + rtt/2)
-      break;
-    }
-    case 'welcome':
-    case 'state': {
-      log(`Show state received: ${msg.isPlaying ? 'playing' : 'paused'} @ ${formatTime(msg.position as number)}`, 'info');
       break;
     }
     case 'audience_count': {
       const count = msg.count as number;
       statListeners.textContent = String(count);
-      audienceCountHeaderEl.textContent = `${count} listener${count !== 1 ? 's' : ''}`;
+      audienceCountEl.textContent = `${count} listener${count !== 1 ? 's' : ''}`;
       break;
     }
     case 'error': {
@@ -196,210 +190,211 @@ function stopPingLoop() {
   if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
 }
 
-// ── Audio Loading ─────────────────────────────────────────────────────────────
-async function loadAudio(file: File) {
-  log(`Loading audio: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
-  loadBtn.disabled = true;
-
-  try {
-    if (!audioCtx) {
-      audioCtx = new AudioContext();
-      analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize = 2048;
-      analyserNode.connect(audioCtx.destination);
-    }
-
-    const arrayBuffer = await file.arrayBuffer();
-    audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    audioDuration = audioBuffer.duration;
-
-    seekBar.max = String(audioDuration);
-    seekBar.value = '0';
-    totalTimeEl.textContent = formatTime(audioDuration);
-    currentTimeEl.textContent = '0:00';
-
-    if (!audioNameInput.value) {
-      audioNameInput.value = file.name.replace(/\.[^.]+$/, '');
-    }
-
-    log(`Audio loaded: ${formatTime(audioDuration)} duration`, 'success');
-
-    // Draw static waveform
-    drawWaveform(audioBuffer);
-
-    // Broadcast load command to audience
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'command',
-        action: 'load',
-        position: 0,
-        masterTs: audioCtx.currentTime,
-        audioFile: audioNameInput.value,
-      }));
-      log('Broadcast: audio loaded to audience', 'success');
-    }
-
-    if (ws?.readyState === WebSocket.OPEN) {
-      playPauseBtn.disabled = false;
-      seekBar.disabled = false;
-      resyncBtn.disabled = false;
-    }
-
-    loadBtn.disabled = false;
-  } catch (err) {
-    log(`Failed to load audio: ${err}`, 'error');
-    loadBtn.disabled = false;
+// ── Broadcast Helpers ─────────────────────────────────────────────────────────
+function send(payload: object) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
   }
 }
 
-// ── Waveform Drawing ──────────────────────────────────────────────────────────
-function drawWaveform(buffer: AudioBuffer) {
-  const ctx = waveformCanvas.getContext('2d')!;
-  const W = waveformCanvas.offsetWidth || 800;
-  const H = 60;
-  waveformCanvas.width = W;
-  waveformCanvas.height = H;
+function broadcastLoad() {
+  const name = videoFilenameEl.textContent || 'show';
+  send({
+    type: 'command',
+    action: 'load',
+    position: 0,
+    masterTs: Date.now(),
+    audioFile: name,
+  });
+  log(`Broadcast: LOAD "${name}"`, 'success');
+}
 
-  const data = buffer.getChannelData(0);
-  const step = Math.ceil(data.length / W);
-  const amp = H / 2;
+function broadcastPlay(position?: number) {
+  const pos = position ?? videoPlayer.currentTime;
+  send({
+    type: 'command',
+    action: 'play',
+    position: pos,
+    masterTs: Date.now(),
+  });
+  log(`Broadcast: PLAY @ ${formatTime(pos)}`, 'success');
+}
 
-  ctx.fillStyle = '#1c1c28';
-  ctx.fillRect(0, 0, W, H);
-  ctx.strokeStyle = '#6c63ff';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
+function broadcastPause(position?: number) {
+  const pos = position ?? videoPlayer.currentTime;
+  send({
+    type: 'command',
+    action: 'pause',
+    position: pos,
+    masterTs: Date.now(),
+  });
+  log(`Broadcast: PAUSE @ ${formatTime(pos)}`, 'success');
+}
 
-  for (let i = 0; i < W; i++) {
-    let min = 1, max = -1;
-    for (let j = 0; j < step; j++) {
-      const v = data[i * step + j] || 0;
-      if (v < min) min = v;
-      if (v > max) max = v;
-    }
-    ctx.moveTo(i, amp + min * amp);
-    ctx.lineTo(i, amp + max * amp);
+function broadcastSeek(position: number, isPlaying: boolean) {
+  send({
+    type: 'command',
+    action: isPlaying ? 'play' : 'seek',
+    position,
+    masterTs: Date.now(),
+  });
+  log(`Broadcast: SEEK to ${formatTime(position)}`, 'success');
+}
+
+// ── Video File Loading ────────────────────────────────────────────────────────
+function loadVideoFile(file: File) {
+  // Revoke previous object URL to free memory
+  if (videoObjectUrl) {
+    URL.revokeObjectURL(videoObjectUrl);
   }
-  ctx.stroke();
+
+  videoObjectUrl = URL.createObjectURL(file);
+  videoPlayer.src = videoObjectUrl;
+  videoPlayer.load();
+
+  // Strip extension for display name
+  const displayName = file.name.replace(/\.[^.]+$/, '');
+  videoFilenameEl.textContent = displayName;
+
+  log(`Loading video: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
 }
 
-// ── Playback Controls ─────────────────────────────────────────────────────────
-function getCurrentAudioPosition(): number {
-  if (!audioCtx) return 0;
-  if (!isPlaying) return playStartPos;
-  return playStartPos + (audioCtx.currentTime - playStartTime);
-}
+// ── Video Event Handlers ──────────────────────────────────────────────────────
+videoPlayer.addEventListener('loadedmetadata', () => {
+  const dur = videoPlayer.duration;
+  seekBar.max = String(dur);
+  seekBar.value = '0';
+  totalTimeEl.textContent = formatTime(dur);
+  currentTimeEl.textContent = formatTime(0);
 
-function startPlayback(fromPosition: number) {
-  if (!audioCtx || !audioBuffer || !analyserNode) return;
-  stopPlayback();
+  videoPanel.classList.add('has-video');
+  updateTransportEnabled(ws?.readyState === WebSocket.OPEN);
 
-  sourceNode = audioCtx.createBufferSource();
-  sourceNode.buffer = audioBuffer;
-  sourceNode.connect(analyserNode);
-  sourceNode.start(0, fromPosition);
-  sourceNode.onended = () => {
-    if (isPlaying) {
-      isPlaying = false;
-      playPauseBtn.textContent = '▶';
-      playPauseBtn.className = 'play-btn play';
-      statState.textContent = 'ENDED';
-    }
-  };
+  log(`Video ready: ${formatTime(dur)} duration`, 'success');
 
-  playStartPos = fromPosition;
-  playStartTime = audioCtx.currentTime;
-  isPlaying = true;
+  // Broadcast load to audience if connected
+  if (ws?.readyState === WebSocket.OPEN) {
+    broadcastLoad();
+  }
+});
+
+videoPlayer.addEventListener('play', () => {
   playPauseBtn.textContent = '⏸';
   playPauseBtn.className = 'play-btn pause';
   statState.textContent = 'PLAYING';
   startUILoop();
-}
 
-function stopPlayback() {
-  if (sourceNode) {
-    try { sourceNode.stop(); } catch { /* already stopped */ }
-    sourceNode.disconnect();
-    sourceNode = null;
+  // Throttle broadcasts to avoid double-firing on seek+play
+  if (broadcastThrottle) clearTimeout(broadcastThrottle);
+  broadcastThrottle = setTimeout(() => {
+    broadcastPlay();
+    broadcastThrottle = null;
+  }, 50);
+});
+
+videoPlayer.addEventListener('pause', () => {
+  playPauseBtn.textContent = '▶';
+  playPauseBtn.className = 'play-btn play';
+  statState.textContent = videoPlayer.ended ? 'ENDED' : 'PAUSED';
+  stopUILoop();
+  updateUI();
+
+  if (!isSeeking) {
+    broadcastPause();
   }
+});
+
+videoPlayer.addEventListener('seeked', () => {
+  if (!isSeeking) {
+    // Seeked programmatically or via native controls
+    broadcastSeek(videoPlayer.currentTime, !videoPlayer.paused);
+  }
+  updateUI();
+});
+
+videoPlayer.addEventListener('ended', () => {
+  statState.textContent = 'ENDED';
+  stopUILoop();
+  broadcastPause(videoPlayer.duration);
+});
+
+// ── Transport Controls ────────────────────────────────────────────────────────
+function updateTransportEnabled(enabled: boolean) {
+  playPauseBtn.disabled = !enabled;
+  seekBar.disabled = !enabled;
+  resyncBtn.disabled = !enabled;
 }
 
-function togglePlayPause() {
-  if (!audioCtx || !audioBuffer) return;
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-
-  const position = getCurrentAudioPosition();
-
-  if (isPlaying) {
-    // Pause
-    stopPlayback();
-    playStartPos = position;
-    isPlaying = false;
-    playPauseBtn.textContent = '▶';
-    playPauseBtn.className = 'play-btn play';
-    statState.textContent = 'PAUSED';
-    stopUILoop();
-
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'command',
-        action: 'pause',
-        position,
-        masterTs: audioCtx.currentTime,
-      }));
-      log(`Broadcast: PAUSE @ ${formatTime(position)}`, 'success');
-    }
+playPauseBtn.addEventListener('click', () => {
+  if (videoPlayer.paused) {
+    videoPlayer.play();
   } else {
-    // Play
-    startPlayback(position);
-
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'command',
-        action: 'play',
-        position,
-        masterTs: audioCtx.currentTime,
-      }));
-      log(`Broadcast: PLAY @ ${formatTime(position)}`, 'success');
-    }
+    videoPlayer.pause();
   }
-}
+});
 
-function seekTo(position: number) {
-  if (!audioCtx || !audioBuffer) return;
-  const wasPlaying = isPlaying;
+seekBar.addEventListener('mousedown', () => { isSeeking = true; });
+seekBar.addEventListener('touchstart', () => { isSeeking = true; }, { passive: true });
 
-  if (isPlaying) stopPlayback();
-  playStartPos = position;
-  isPlaying = false;
+seekBar.addEventListener('input', () => {
+  currentTimeEl.textContent = formatTime(Number(seekBar.value));
+});
 
-  if (wasPlaying) {
-    startPlayback(position);
-  }
+seekBar.addEventListener('change', () => {
+  const pos = Number(seekBar.value);
+  videoPlayer.currentTime = pos;
+  isSeeking = false;
+  broadcastSeek(pos, !videoPlayer.paused);
+});
 
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      type: 'command',
-      action: wasPlaying ? 'play' : 'seek',
-      position,
-      masterTs: audioCtx.currentTime,
-    }));
-    log(`Broadcast: SEEK to ${formatTime(position)}`, 'success');
-  }
-}
-
-function forceResync() {
-  if (!audioCtx || !ws || ws.readyState !== WebSocket.OPEN) return;
-  const position = getCurrentAudioPosition();
-  const action = isPlaying ? 'play' : 'pause';
-  ws.send(JSON.stringify({
+resyncBtn.addEventListener('click', () => {
+  const pos = videoPlayer.currentTime;
+  const action = videoPlayer.paused ? 'pause' : 'play';
+  send({
     type: 'command',
     action,
-    position,
-    masterTs: audioCtx.currentTime,
-  }));
-  log(`Force resync: ${action.toUpperCase()} @ ${formatTime(position)}`, 'warn');
+    position: pos,
+    masterTs: Date.now(),
+  });
+  log(`Force resync: ${action.toUpperCase()} @ ${formatTime(pos)}`, 'warn');
+});
+
+// ── Fullscreen ────────────────────────────────────────────────────────────────
+fullscreenBtn.addEventListener('click', toggleFullscreen);
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+    fullscreenBtn.textContent = '⛶ Full';
+  } else {
+    videoPanel.requestFullscreen().then(() => {
+      fullscreenBtn.textContent = '✕ Exit';
+    }).catch(() => {
+      // Try video element directly as fallback
+      videoPlayer.requestFullscreen?.();
+    });
+  }
 }
+
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) {
+    fullscreenBtn.textContent = '⛶ Full';
+  }
+});
+
+// Keyboard shortcut: Space = play/pause, F = fullscreen
+document.addEventListener('keydown', (e) => {
+  if (e.target instanceof HTMLInputElement) return;
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (videoPlayer.readyState >= 1) {
+      videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause();
+    }
+  }
+  if (e.code === 'KeyF') {
+    toggleFullscreen();
+  }
+});
 
 // ── UI Update Loop ────────────────────────────────────────────────────────────
 function startUILoop() {
@@ -412,59 +407,62 @@ function stopUILoop() {
 }
 
 function updateUI() {
-  if (!audioBuffer) return;
-  const pos = getCurrentAudioPosition();
-  const clampedPos = Math.min(pos, audioDuration);
+  if (videoPlayer.readyState < 1) return;
+  const pos = videoPlayer.currentTime;
   if (!isSeeking) {
-    seekBar.value = String(clampedPos);
-    currentTimeEl.textContent = formatTime(clampedPos);
+    seekBar.value = String(pos);
+    currentTimeEl.textContent = formatTime(pos);
   }
-  statPosition.textContent = formatTime(clampedPos);
+  statPosition.textContent = formatTime(pos);
 }
 
-// ── Event Listeners ───────────────────────────────────────────────────────────
-connectBtn.addEventListener('click', connectWebSocket);
+// ── Video File Drop / Click ───────────────────────────────────────────────────
+videoDropZone.addEventListener('click', () => videoFileInput.click());
+changeVideoBtn.addEventListener('click', () => videoFileInput.click());
 
-loadBtn.addEventListener('click', () => {
-  if (audioFileInput.files?.[0]) {
-    loadAudio(audioFileInput.files[0]);
-  } else {
-    log('Please select an audio file first', 'warn');
+videoFileInput.addEventListener('change', () => {
+  const file = videoFileInput.files?.[0];
+  if (file) loadVideoFile(file);
+});
+
+// Drag and drop onto the video panel
+videoPanel.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  videoPanel.classList.add('drag-active');
+  videoDropZone.classList.add('drag-over');
+});
+
+videoPanel.addEventListener('dragleave', () => {
+  videoPanel.classList.remove('drag-active');
+  videoDropZone.classList.remove('drag-over');
+});
+
+videoPanel.addEventListener('drop', (e) => {
+  e.preventDefault();
+  videoPanel.classList.remove('drag-active');
+  videoDropZone.classList.remove('drag-over');
+  const file = e.dataTransfer?.files?.[0];
+  if (file && (file.type.startsWith('video/') || file.type.startsWith('audio/'))) {
+    loadVideoFile(file);
+  } else if (file) {
+    log('Please drop a video or audio file', 'warn');
   }
 });
 
-audioFileInput.addEventListener('change', () => {
-  if (audioFileInput.files?.[0]) {
-    loadAudio(audioFileInput.files[0]);
-  }
-});
-
-playPauseBtn.addEventListener('click', togglePlayPause);
-
-seekBar.addEventListener('mousedown', () => { isSeeking = true; });
-seekBar.addEventListener('touchstart', () => { isSeeking = true; });
-seekBar.addEventListener('input', () => {
-  currentTimeEl.textContent = formatTime(Number(seekBar.value));
-});
-seekBar.addEventListener('change', () => {
-  isSeeking = false;
-  seekTo(Number(seekBar.value));
-});
-
-resyncBtn.addEventListener('click', forceResync);
-
+// ── Copy Audience URL ─────────────────────────────────────────────────────────
 copyUrlBtn.addEventListener('click', () => {
   navigator.clipboard.writeText(audienceUrlEl.textContent || '').then(() => {
     copyUrlBtn.textContent = 'Copied!';
-    setTimeout(() => { copyUrlBtn.textContent = 'Copy Link'; }, 2000);
+    setTimeout(() => { copyUrlBtn.textContent = 'Copy Audience Link'; }, 2000);
   });
 });
 
-// Auto-fill worker URL from localStorage
+// ── Persist Worker URL ────────────────────────────────────────────────────────
 const savedUrl = localStorage.getItem('cinewav_worker_url');
 if (savedUrl) workerUrlInput.value = savedUrl;
 workerUrlInput.addEventListener('change', () => {
   localStorage.setItem('cinewav_worker_url', workerUrlInput.value);
 });
 
-log('Cinewav Master ready. Enter your Show ID and Sync Server URL to begin.', 'info');
+// ── Init ──────────────────────────────────────────────────────────────────────
+log('Cinewav Master ready. Drop a video file and connect to your sync server.', 'info');
