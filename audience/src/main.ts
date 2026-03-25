@@ -403,18 +403,27 @@ function updatePlayPauseBtn() {
 }
 
 playPauseBtn.addEventListener('click', async () => {
-  // FIX: Create AudioContext on first user gesture if it doesn't exist yet
-  ensureAudioContext();
-  if (audioCtx!.state === 'suspended') await audioCtx!.resume();
-
   // If audio isn't decoded yet, nothing to play
   if (!audioBuffer) return;
 
+  // FIX: Capture intent and update DOM BEFORE any await.
+  // On Android Chrome, an async handler yields to the browser on the first
+  // await, which re-renders the button state and undoes our innerHTML change.
+  // By updating the DOM synchronously first, the visual state is committed.
   if (isPlaying) {
+    // Pause immediately — no await needed
     stopPlayback();
     setSyncStatus('synced', 'Paused locally');
   } else {
-    // Resume: sync to master position if available, otherwise use last known position
+    // Optimistically show pause icon before the async resume
+    isPlaying = true;
+    updatePlayPauseBtn();
+
+    // Now do the async work
+    ensureAudioContext();
+    if (audioCtx!.state === 'suspended') await audioCtx!.resume();
+
+    // Sync to master position if available, otherwise use last known position
     const masterPos = syncEngine?.getEstimatedMasterPosition() ?? playStartPos;
     startPlayback(masterPos);
     setSyncStatus('synced', 'In sync');
@@ -456,36 +465,39 @@ resyncBtn.addEventListener('click', () => {
 });
 
 /**
- * FIX: applyOffsetChange is now synchronous and uses local isPlaying state.
- * This makes fine-tune buttons react instantly — no async delay.
+ * FIX: applyOffsetChange receives the OLD offset value so it can correctly
+ * strip it from the current position before applying the new one.
+ * Bug was: manualOffsetMs was already updated before this ran, causing
+ * double-correction (stripping new offset instead of old offset).
  */
-function applyOffsetChange() {
-  if (!audioBuffer) return;
-  if (isPlaying) {
-    // Recalculate current position and restart immediately with new offset
-    const currentPos = getCurrentPosition();
-    // Strip the old manual offset out of currentPos before reapplying
-    const rawPos = currentPos - (manualOffsetMs / 1000);
-    startPlayback(rawPos);
-  }
+function applyOffsetChange(oldOffsetMs: number) {
+  if (!audioBuffer || !isPlaying) return;
+  // Get current raw position by stripping the OLD offset that was baked in
+  const currentPos = getCurrentPosition();
+  const rawPos = currentPos - (oldOffsetMs / 1000);
+  // startPlayback() will apply the new manualOffsetMs automatically
+  startPlayback(rawPos);
 }
 
 ftMinus.addEventListener('click', () => {
+  const old = manualOffsetMs;
   manualOffsetMs -= 50;
   saveManualOffset();
-  applyOffsetChange();
+  applyOffsetChange(old);
 });
 
 ftPlus.addEventListener('click', () => {
+  const old = manualOffsetMs;
   manualOffsetMs += 50;
   saveManualOffset();
-  applyOffsetChange();
+  applyOffsetChange(old);
 });
 
 ftReset.addEventListener('click', () => {
+  const old = manualOffsetMs;
   manualOffsetMs = 0;
   saveManualOffset();
-  applyOffsetChange();
+  applyOffsetChange(old);
 });
 
 // ── Join Flow ─────────────────────────────────────────────────────────────────
@@ -506,6 +518,8 @@ async function joinShow() {
 
   try {
     // ── Step 1: Fetch show state ──────────────────────────────────────────────
+    // Record the time BEFORE the fetch so we can estimate elapsed time later
+    const stateFetchedAt = Date.now();
     const stateRes = await fetch(`${serverBaseUrl}/api/show/${showId}/state`);
     if (!stateRes.ok) throw new Error(`Server error: ${stateRes.status}`);
     const state = await stateRes.json() as {
@@ -605,12 +619,16 @@ async function joinShow() {
         pendingCommand = null;
         await handleShowCommand(cmd);
       } else if (state.isPlaying) {
-        // Show was already playing when we joined — estimate current position
+        // Show was already playing when we joined.
+        // FIX: Estimate current master position by adding the time elapsed
+        // since we fetched the state (covers download time + decode time).
+        const elapsedSinceStateSec = (Date.now() - stateFetchedAt) / 1000;
+        const estimatedPosition = state.position + elapsedSinceStateSec;
         const cmd: ShowCommand = {
           action: 'play',
-          position: state.position + ((Date.now() - Date.now()) / 1000), // will be corrected by transit
+          position: estimatedPosition,
           masterTs: 0,
-          serverTs: Date.now(),
+          serverTs: stateFetchedAt,
           audioFile: state.audioFile,
         };
         await handleShowCommand(cmd);
