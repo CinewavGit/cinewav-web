@@ -10,9 +10,6 @@ jobs:
   deploy-worker:
     name: Deploy Sync Worker
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: worker
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,30 +22,29 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: worker/pnpm-lock.yaml
 
       - name: Install dependencies
+        working-directory: worker
         run: pnpm install --frozen-lockfile
 
       - name: Type check
+        working-directory: worker
         run: pnpm exec tsc --noEmit
 
       - name: Deploy Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: worker
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec wrangler deploy
 
   # ── 2. Deploy the Master Player app ───────────────────────────────────────
   deploy-master:
     name: Deploy Master Player
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: master
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,30 +57,32 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: master/pnpm-lock.yaml
 
       - name: Install dependencies
+        working-directory: master
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        working-directory: master
         run: pnpm build
 
+      - name: Install Wrangler
+        run: pnpm add -g wrangler
+
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name cinewav-master --branch main
+        working-directory: master
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler pages deploy dist --project-name cinewav-master --branch main --commit-dirty=true
 
   # ── 3. Deploy the Audience PWA ────────────────────────────────────────────
   deploy-audience:
     name: Deploy Audience PWA
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: audience
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -97,19 +95,24 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: audience/pnpm-lock.yaml
 
       - name: Install dependencies
+        working-directory: audience
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        working-directory: audience
         run: pnpm build
 
+      - name: Install Wrangler
+        run: pnpm add -g wrangler
+
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name cinewav-audience --branch main
+        working-directory: audience
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler pages deploy dist --project-name cinewav-audience --branch main --commit-dirty=true
