@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Cinewav" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <title>Cinewav — Audience</title>
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --surface: #13131a;
+      --surface2: #1c1c28;
+      --border: #2a2a3d;
+      --accent: #6c63ff;
+      --success: #2ed573;
+      --warning: #ffa502;
+      --danger: #ff4757;
+      --text: #e8e8f0;
+      --text-muted: #7a7a9a;
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    /* ── Screens ── */
+    .screen {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-y: auto;
+    }
+    .screen.active { display: flex; }
+
+    /* ── Join Screen ── */
+    #screen-join {
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+      gap: 24px;
+    }
+
+    .brand {
+      text-align: center;
+    }
+
+    .brand-icon {
+      width: 80px;
+      height: 80px;
+      background: linear-gradient(135deg, var(--accent), #a855f7);
+      border-radius: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 40px;
+      margin: 0 auto 16px;
+      box-shadow: 0 8px 32px rgba(108, 99, 255, 0.4);
+    }
+
+    .brand h1 {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -1px;
+    }
+
+    .brand p {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-top: 6px;
+    }
+
+    .join-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      width: 100%;
+      max-width: 400px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    input[type="text"] {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      color: var(--text);
+      font-size: 16px; /* 16px prevents iOS zoom */
+      outline: none;
+      transition: border-color 0.2s;
+      width: 100%;
+    }
+
+    input[type="text"]:focus { border-color: var(--accent); }
+
+    .btn {
+      padding: 14px 20px;
+      border: none;
+      border-radius: 12px;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+      width: 100%;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+    .btn-primary:active { transform: scale(0.98); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Download Screen ── */
+    #screen-download {
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+      gap: 20px;
+      text-align: center;
+    }
+
+    .download-icon {
+      font-size: 64px;
+    }
+
+    .progress-bar-container {
+      width: 100%;
+      max-width: 320px;
+      background: var(--surface2);
+      border-radius: 8px;
+      height: 8px;
+      overflow: hidden;
+    }
+
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #a855f7);
+      border-radius: 8px;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    .progress-text {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    /* ── Player Screen ── */
+    #screen-player {
+      padding: 0;
+    }
+
+    .player-header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .player-header .logo {
+      font-size: 18px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .status-dot.synced { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .status-dot.syncing { background: var(--warning); animation: pulse 1s infinite; }
+    .status-dot.drifted { background: var(--danger); animation: pulse 0.5s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.2; }
+    }
+
+    .player-body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+      gap: 24px;
+      text-align: center;
+    }
+
+    .album-art {
+      width: 200px;
+      height: 200px;
+      background: linear-gradient(135deg, #1c1c28, #2a2a3d);
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 80px;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .album-art.playing::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(circle at 50% 50%, rgba(108,99,255,0.15), transparent 70%);
+      animation: glow 2s ease-in-out infinite alternate;
+    }
+
+    @keyframes glow {
+      from { opacity: 0.5; }
+      to { opacity: 1; }
+    }
+
+    .track-info h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .track-info p {
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* Seek bar (display only for audience) */
+    .seek-display {
+      width: 100%;
+      max-width: 320px;
+    }
+
+    .seek-track {
+      width: 100%;
+      height: 4px;
+      background: var(--surface2);
+      border-radius: 2px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .seek-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #a855f7);
+      border-radius: 2px;
+      width: 0%;
+      transition: width 0.25s linear;
+    }
+
+    .seek-times {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 6px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Sync stats */
+    .sync-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      width: 100%;
+      max-width: 320px;
+    }
+
+    .sync-stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      text-align: center;
+    }
+
+    .sync-stat-value {
+      font-size: 18px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--accent);
+    }
+
+    .sync-stat-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-top: 2px;
+    }
+
+    /* Waiting overlay */
+    .waiting-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(10, 10, 15, 0.85);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      backdrop-filter: blur(4px);
+    }
+
+    .waiting-overlay.hidden { display: none; }
+
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .player-footer {
+      padding: 16px 24px;
+      padding-bottom: calc(16px + env(safe-area-inset-bottom));
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+    }
+
+    .footer-note {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      line-height: 1.5;
+    }
+
+    .screen-off-note {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      margin-top: 8px;
+    }
+
+    /* Error screen */
+    #screen-error {
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+      gap: 16px;
+      text-align: center;
+    }
+
+    .error-icon { font-size: 48px; }
+    .error-msg { color: var(--danger); font-size: 15px; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Join Screen ── -->
+  <div class="screen active" id="screen-join">
+    <div class="brand">
+      <div class="brand-icon">🎬</div>
+      <h1>Cinewav</h1>
+      <p>Synchronized cinema audio</p>
+    </div>
+    <div class="join-card">
+      <div class="form-group">
+        <label for="join-show-id">Show ID</label>
+        <input type="text" id="join-show-id" placeholder="Enter show ID" autocomplete="off" autocapitalize="none" />
+      </div>
+      <div class="form-group">
+        <label for="join-server-url">Server URL</label>
+        <input type="text" id="join-server-url" placeholder="https://cinewav-sync.workers.dev" autocomplete="off" autocapitalize="none" />
+      </div>
+      <button class="btn btn-primary" id="join-btn">Join Show</button>
+    </div>
+    <p style="font-size:12px;color:var(--text-muted);text-align:center;max-width:300px;">
+      Your audio ticket will be downloaded and stored on your device for smooth, uninterrupted playback.
+    </p>
+  </div>
+
+  <!-- ── Download Screen ── -->
+  <div class="screen" id="screen-download">
+    <div class="download-icon">⬇️</div>
+    <h2>Downloading Audio Ticket</h2>
+    <p style="color:var(--text-muted);font-size:14px;" id="download-filename">Preparing…</p>
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="download-progress"></div>
+    </div>
+    <p class="progress-text" id="download-percent">0%</p>
+    <p style="font-size:12px;color:var(--text-muted);max-width:280px;text-align:center;">
+      This file is saved to your device. You won't need to re-download it for the same show.
+    </p>
+  </div>
+
+  <!-- ── Player Screen ── -->
+  <div class="screen" id="screen-player">
+    <div class="player-header">
+      <div class="logo">🎬 Cinewav</div>
+      <div class="status-pill">
+        <div class="status-dot" id="sync-dot"></div>
+        <span id="sync-status-text">Waiting</span>
+      </div>
+    </div>
+
+    <div class="player-body" style="position:relative;">
+      <div class="album-art" id="album-art">🎬</div>
+
+      <div class="track-info">
+        <h2 id="track-name">Waiting for show…</h2>
+        <p id="show-id-display"></p>
+      </div>
+
+      <div class="seek-display">
+        <div class="seek-track">
+          <div class="seek-fill" id="seek-fill"></div>
+        </div>
+        <div class="seek-times">
+          <span id="p-current-time">0:00</span>
+          <span id="p-total-time">0:00</span>
+        </div>
+      </div>
+
+      <div class="sync-stats">
+        <div class="sync-stat">
+          <div class="sync-stat-value" id="stat-offset">—</div>
+          <div class="sync-stat-label">Clock Offset</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-value" id="stat-drift">—</div>
+          <div class="sync-stat-label">Current Drift</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-value" id="stat-resyncs">0</div>
+          <div class="sync-stat-label">Resyncs</div>
+        </div>
+        <div class="sync-stat">
+          <div class="sync-stat-value" id="stat-rtt">—</div>
+          <div class="sync-stat-label">Server RTT</div>
+        </div>
+      </div>
+
+      <!-- Waiting for master overlay -->
+      <div class="waiting-overlay" id="waiting-overlay">
+        <div class="spinner"></div>
+        <p style="font-size:15px;font-weight:600;">Waiting for show to start…</p>
+        <p style="font-size:13px;color:var(--text-muted);">Audio ready. Stay on this screen.</p>
+      </div>
+    </div>
+
+    <div class="player-footer">
+      <div class="screen-off-note">
+        🔒 You can lock your screen — audio will keep playing in sync
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Error Screen ── -->
+  <div class="screen" id="screen-error">
+    <div class="error-icon">⚠️</div>
+    <h2>Connection Error</h2>
+    <p class="error-msg" id="error-msg">Something went wrong.</p>
+    <button class="btn btn-primary" onclick="location.reload()" style="max-width:200px;margin-top:8px;">Try Again</button>
+  </div>
+
+  <!-- Silent audio loop to keep AudioContext alive when screen is off -->
+  <audio id="silent-audio" loop preload="auto">
+    <source src="/silent.mp3" type="audio/mpeg" />
+  </audio>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

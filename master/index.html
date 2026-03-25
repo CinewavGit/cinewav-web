@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cinewav — Master Control</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --surface: #13131a;
+      --surface2: #1c1c28;
+      --border: #2a2a3d;
+      --accent: #6c63ff;
+      --accent-hover: #8b85ff;
+      --danger: #ff4757;
+      --success: #2ed573;
+      --warning: #ffa502;
+      --text: #e8e8f0;
+      --text-muted: #7a7a9a;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+    }
+
+    .badge {
+      background: var(--accent);
+      color: white;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 20px;
+      letter-spacing: 0.5px;
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      display: inline-block;
+      margin-right: 4px;
+    }
+    .status-dot.connected { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
+    .status-dot.error { background: var(--danger); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    main {
+      flex: 1;
+      padding: 24px;
+      max-width: 900px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .card-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex: 1;
+      min-width: 160px;
+    }
+
+    label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    input[type="text"], input[type="file"] {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+
+    input[type="file"] {
+      cursor: pointer;
+      padding: 8px 12px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+    .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+    .btn-success {
+      background: var(--success);
+      color: #0a0a0f;
+    }
+    .btn-success:hover { filter: brightness(1.1); }
+    .btn-success:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-danger {
+      background: var(--danger);
+      color: white;
+    }
+    .btn-danger:hover { filter: brightness(1.1); }
+    .btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-ghost {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Transport controls */
+    .transport {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .play-btn {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      font-size: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .play-btn.play {
+      background: var(--success);
+      color: #0a0a0f;
+      box-shadow: 0 0 20px rgba(46, 213, 115, 0.3);
+    }
+    .play-btn.pause {
+      background: var(--warning);
+      color: #0a0a0f;
+      box-shadow: 0 0 20px rgba(255, 165, 2, 0.3);
+    }
+    .play-btn:hover { transform: scale(1.05); }
+    .play-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+
+    /* Seek bar */
+    .seek-container {
+      flex: 1;
+      min-width: 200px;
+    }
+
+    .seek-bar {
+      width: 100%;
+      height: 6px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: var(--surface2);
+      border-radius: 3px;
+      outline: none;
+      cursor: pointer;
+    }
+
+    .seek-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 6px rgba(108, 99, 255, 0.5);
+    }
+
+    .time-display {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    /* Stats grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+
+    .stat-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-top: 4px;
+    }
+
+    /* QR / Share section */
+    .share-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .share-url {
+      flex: 1;
+      min-width: 200px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: var(--text-muted);
+      font-family: monospace;
+      word-break: break-all;
+    }
+
+    /* Log */
+    .log {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--text-muted);
+      height: 120px;
+      overflow-y: auto;
+      line-height: 1.6;
+    }
+
+    .log-entry { margin-bottom: 2px; }
+    .log-entry.info { color: var(--text-muted); }
+    .log-entry.success { color: var(--success); }
+    .log-entry.warn { color: var(--warning); }
+    .log-entry.error { color: var(--danger); }
+
+    /* Audio waveform visualizer */
+    #waveform {
+      width: 100%;
+      height: 60px;
+      background: var(--surface2);
+      border-radius: 8px;
+      margin-top: 12px;
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      main { padding: 16px; }
+      .form-row { flex-direction: column; }
+      .transport { justify-content: center; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <div class="logo-icon">🎬</div>
+      Cinewav
+      <span class="badge">MASTER</span>
+    </div>
+    <div class="status-bar">
+      <span>
+        <span class="status-dot" id="ws-dot"></span>
+        <span id="ws-status">Disconnected</span>
+      </span>
+      <span id="audience-count-header">0 listeners</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Show Setup -->
+    <div class="card">
+      <div class="card-title">Show Setup</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="show-id">Show ID</label>
+          <input type="text" id="show-id" placeholder="e.g. show-001" value="demo" />
+        </div>
+        <div class="form-group">
+          <label for="worker-url">Sync Server URL</label>
+          <input type="text" id="worker-url" placeholder="wss://cinewav-sync.your-account.workers.dev" />
+        </div>
+        <button class="btn btn-primary" id="connect-btn">Connect</button>
+      </div>
+    </div>
+
+    <!-- Audio Load -->
+    <div class="card">
+      <div class="card-title">Audio File</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="audio-file">Load Audio File</label>
+          <input type="file" id="audio-file" accept="audio/*" />
+        </div>
+        <div class="form-group">
+          <label for="audio-name">Track Name</label>
+          <input type="text" id="audio-name" placeholder="e.g. Feature Film Audio" />
+        </div>
+        <button class="btn btn-ghost" id="load-btn" disabled>Load &amp; Broadcast</button>
+      </div>
+      <canvas id="waveform"></canvas>
+    </div>
+
+    <!-- Transport Controls -->
+    <div class="card">
+      <div class="card-title">Transport</div>
+      <div class="transport">
+        <button class="play-btn play" id="play-pause-btn" disabled title="Play / Pause">▶</button>
+        <div class="seek-container">
+          <input type="range" class="seek-bar" id="seek-bar" min="0" max="100" value="0" step="0.1" disabled />
+          <div class="time-display">
+            <span id="current-time">0:00:00</span> / <span id="total-time">0:00:00</span>
+          </div>
+        </div>
+        <button class="btn btn-ghost" id="resync-btn" disabled title="Force resync all clients">⟳ Resync All</button>
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card">
+      <div class="card-title">Live Stats</div>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-value" id="stat-listeners">0</div>
+          <div class="stat-label">Listeners</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-position">0:00</div>
+          <div class="stat-label">Position</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-latency">—</div>
+          <div class="stat-label">Server Latency</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-state">STOPPED</div>
+          <div class="stat-label">State</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Audience Link -->
+    <div class="card">
+      <div class="card-title">Audience Link</div>
+      <div class="share-row">
+        <div class="share-url" id="audience-url">Connect to a show first…</div>
+        <button class="btn btn-ghost" id="copy-url-btn" disabled>Copy Link</button>
+      </div>
+      <p style="font-size:12px;color:var(--text-muted);margin-top:10px;">
+        Share this link with your audience. They will download the audio file and sync automatically.
+      </p>
+    </div>
+
+    <!-- Activity Log -->
+    <div class="card">
+      <div class="card-title">Activity Log</div>
+      <div class="log" id="log"></div>
+    </div>
+  </main>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

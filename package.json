@@ -1,0 +1,19 @@
+{
+  "name": "cinewav-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Web-based synchronized audio system — Cinewav Web MVP",
+  "workspaces": [
+    "worker",
+    "master",
+    "audience"
+  ],
+  "scripts": {
+    "dev:worker": "cd worker && wrangler dev",
+    "dev:master": "cd master && pnpm dev",
+    "dev:audience": "cd audience && pnpm dev",
+    "deploy:worker": "cd worker && wrangler deploy",
+    "deploy:master": "cd master && wrangler pages deploy dist --project-name cinewav-master",
+    "deploy:audience": "cd audience && wrangler pages deploy dist --project-name cinewav-audience"
+  }
+}
