@@ -12,6 +12,17 @@
  */
 
 // ── DOM Elements ─────────────────────────────────────────────────────────────
+// Audio upload elements
+const audioDropZone       = document.getElementById('audio-drop-zone')!;
+const audioFileHidden     = (() => { const i = document.createElement('input'); i.type = 'file'; i.accept = 'audio/*'; return i; })();
+const uploadProgressWrap  = document.getElementById('upload-progress-wrap')!;
+const uploadFilenameEl    = document.getElementById('upload-filename')!;
+const uploadPercentEl     = document.getElementById('upload-percent')!;
+const uploadBarFill       = document.getElementById('upload-bar-fill') as HTMLElement;
+const audioReadyBadge     = document.getElementById('audio-ready-badge')!;
+const audioReadyName      = document.getElementById('audio-ready-name')!;
+const replaceAudioBtn     = document.getElementById('replace-audio-btn') as HTMLButtonElement;
+
 const wsStatusEl        = document.getElementById('ws-status')!;
 const wsDotEl           = document.getElementById('ws-dot')!;
 const audienceCountEl   = document.getElementById('audience-count-header')!;
@@ -462,6 +473,112 @@ const savedUrl = localStorage.getItem('cinewav_worker_url');
 if (savedUrl) workerUrlInput.value = savedUrl;
 workerUrlInput.addEventListener('change', () => {
   localStorage.setItem('cinewav_worker_url', workerUrlInput.value);
+});
+
+// ── Audio Upload ─────────────────────────────────────────────────────────────
+
+/**
+ * Compute a simple hash of the file for cache-busting on the audience side.
+ * We use the file size + last modified time as a lightweight fingerprint.
+ * For production, you could use SHA-256 via SubtleCrypto.
+ */
+function fileFingerprint(file: File): string {
+  return `${file.size}-${file.lastModified}`;
+}
+
+async function uploadAudioFile(file: File) {
+  if (!currentWorkerBase) {
+    log('Connect to the sync server first before uploading audio', 'warn');
+    return;
+  }
+  if (!currentShowId) {
+    log('Enter a Show ID before uploading audio', 'warn');
+    return;
+  }
+
+  const filename = file.name;
+  const hash = fileFingerprint(file);
+  const uploadUrl = `${currentWorkerBase.replace(/^ws/, 'http')}/api/show/${currentShowId}/audio`;
+
+  // Show progress UI
+  audioDropZone.style.display = 'none';
+  uploadProgressWrap.classList.add('visible');
+  audioReadyBadge.classList.remove('visible');
+  uploadFilenameEl.textContent = filename;
+  uploadPercentEl.textContent = '0%';
+  uploadBarFill.style.width = '0%';
+
+  log(`Uploading audio: ${filename} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
+
+  try {
+    // Use XMLHttpRequest for upload progress events
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', uploadUrl);
+      xhr.setRequestHeader('X-Audio-Filename', filename);
+      xhr.setRequestHeader('X-Audio-Hash', hash);
+      xhr.setRequestHeader('Content-Type', file.type || 'audio/mpeg');
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          uploadBarFill.style.width = `${pct}%`;
+          uploadPercentEl.textContent = `${pct}%`;
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+        } else {
+          reject(new Error(`Upload failed: HTTP ${xhr.status} — ${xhr.responseText}`));
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Upload failed: network error'));
+      xhr.send(file);
+    });
+
+    // Upload complete — show badge
+    uploadProgressWrap.classList.remove('visible');
+    audioReadyBadge.classList.add('visible');
+    audioReadyName.textContent = filename;
+    log(`Audio uploaded: "${filename}" — audience will download automatically`, 'success');
+
+  } catch (err) {
+    uploadProgressWrap.classList.remove('visible');
+    audioDropZone.style.display = '';
+    log(`Audio upload failed: ${err}`, 'error');
+  }
+}
+
+// Audio drop zone interactions
+audioDropZone.addEventListener('click', () => audioFileHidden.click());
+replaceAudioBtn.addEventListener('click', () => {
+  audioReadyBadge.classList.remove('visible');
+  audioDropZone.style.display = '';
+  audioFileHidden.click();
+});
+
+audioFileHidden.addEventListener('change', () => {
+  const file = audioFileHidden.files?.[0];
+  if (file) uploadAudioFile(file);
+});
+
+audioDropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  audioDropZone.classList.add('drag-over');
+});
+audioDropZone.addEventListener('dragleave', () => audioDropZone.classList.remove('drag-over'));
+audioDropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  audioDropZone.classList.remove('drag-over');
+  const file = e.dataTransfer?.files?.[0];
+  if (file && file.type.startsWith('audio/')) {
+    uploadAudioFile(file);
+  } else if (file) {
+    log('Please drop an audio file (MP3, AAC, WAV, M4A)', 'warn');
+  }
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────

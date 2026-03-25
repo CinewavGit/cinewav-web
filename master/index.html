@@ -458,6 +458,78 @@
     }
     .change-video-btn:hover { border-color: var(--accent); color: var(--accent); }
 
+    /* Audio upload drop zone */
+    .audio-drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .audio-drop-zone:hover,
+    .audio-drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(108, 99, 255, 0.05);
+      color: var(--accent);
+    }
+
+    .audio-drop-zone .drop-icon { font-size: 24px; margin-bottom: 4px; }
+    .audio-drop-zone .drop-label { font-weight: 600; color: var(--text); font-size: 13px; }
+
+    /* Upload progress bar */
+    .upload-progress-wrap {
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .upload-progress-wrap.visible { display: flex; }
+
+    .upload-bar-bg {
+      height: 6px;
+      background: var(--surface2);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .upload-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      width: 0%;
+      transition: width 0.2s;
+    }
+
+    .upload-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* Audio ready badge */
+    .audio-ready-badge {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 10px;
+      background: rgba(46, 213, 115, 0.1);
+      border: 1px solid rgba(46, 213, 115, 0.3);
+      border-radius: 6px;
+      font-size: 12px;
+      color: var(--success);
+      margin-top: 8px;
+    }
+
+    .audio-ready-badge.visible { display: flex; }
+    .audio-ready-badge .audio-ready-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
     /* Responsive: stack on small screens */
     @media (max-width: 768px) {
       .layout { flex-direction: column; height: auto; }
@@ -567,6 +639,33 @@
         <p style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">
           Share this link with your audience. They download the audio file once and sync automatically.
         </p>
+      </div>
+
+      <!-- Audio File Upload -->
+      <div class="card">
+        <div class="card-title">Audio File for Audience</div>
+        <div class="audio-drop-zone" id="audio-drop-zone">
+          <div class="drop-icon">🎵</div>
+          <div class="drop-label">Drop audio file here</div>
+          <div>or click to browse — MP3, AAC, WAV, M4A</div>
+          <div style="margin-top:6px;font-size:11px;color:var(--text-muted)">
+            Uploaded once to the cloud. Audience devices download it automatically on join.
+          </div>
+        </div>
+        <div class="upload-progress-wrap" id="upload-progress-wrap">
+          <div class="upload-label">
+            <span id="upload-filename">Uploading…</span>
+            <span id="upload-percent">0%</span>
+          </div>
+          <div class="upload-bar-bg">
+            <div class="upload-bar-fill" id="upload-bar-fill"></div>
+          </div>
+        </div>
+        <div class="audio-ready-badge" id="audio-ready-badge">
+          <span>✓</span>
+          <span class="audio-ready-name" id="audio-ready-name">—</span>
+          <button class="change-video-btn" id="replace-audio-btn" style="margin-left:auto">Replace</button>
+        </div>
       </div>
 
       <!-- Activity Log -->

@@ -14,6 +14,11 @@ class_name = "ShowRoom"
 tag = "v1"
 new_sqlite_classes = ["ShowRoom"]
 
+# R2 bucket for audio file storage (zero egress cost)
+[[r2_buckets]]
+binding = "AUDIO_BUCKET"
+bucket_name = "cinewav-audio"
+
 # CORS origins — update with your actual deployed URLs
 [vars]
 ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:5174,https://cinewav-master.pages.dev,https://cinewav-audience.pages.dev,https://*.cinewav-master.pages.dev,https://*.cinewav-audience.pages.dev"

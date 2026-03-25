@@ -28,7 +28,9 @@ export interface ShowState {
   position: number;       // seconds from start
   masterTs: number;       // master's audio context time when position was set
   serverTs: number;       // server wall-clock ms when state was last updated
-  audioFile: string | null;
+  audioFile: string | null;  // display filename
+  audioHash: string | null;  // hash of audio file — audience uses this to detect changes
+  audioReady: boolean;       // true once audio has been uploaded to R2
   showId: string;
 }
 
@@ -48,6 +50,8 @@ export class ShowRoom {
     masterTs: 0,
     serverTs: 0,
     audioFile: null,
+    audioHash: null,
+    audioReady: false,
     showId: '',
   };
 
@@ -88,6 +92,28 @@ export class ShowRoom {
     // ── REST: GET /state ───────────────────────────────────────────────────
     if (subPath === '/state' && request.method === 'GET') {
       return new Response(JSON.stringify(this.showState), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // ── REST: POST /audio-ready (internal — called by Worker after R2 upload) ─────
+    if (subPath === '/audio-ready' && request.method === 'POST') {
+      const body = await request.json<{ filename: string; hash: string }>();
+      this.showState.audioFile = body.filename;
+      this.showState.audioHash = body.hash;
+      this.showState.audioReady = true;
+      this.showState.serverTs = Date.now();
+      await this.state.storage.put('showState', this.showState);
+      // Broadcast audio-ready to all connected clients so they start downloading
+      const msg = JSON.stringify({
+        type: 'audio_ready',
+        audioFile: body.filename,
+        audioHash: body.hash,
+      });
+      for (const ws of this.state.getWebSockets()) {
+        try { ws.send(msg); } catch { /* ignore */ }
+      }
+      return new Response(JSON.stringify({ ok: true }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -235,6 +261,7 @@ export class ShowRoom {
       this.showState.position = 0;
       this.showState.masterTs = masterTs;
       this.showState.serverTs = serverTs;
+      // Note: audioHash and audioReady are set separately via /audio-ready
     }
 
     // Persist state so it survives Durable Object hibernation

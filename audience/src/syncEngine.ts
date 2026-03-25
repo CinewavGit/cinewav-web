@@ -67,6 +67,7 @@ export class SyncEngine {
   private onStateChange: OnStateChange;
   private onShowCommand: ((cmd: ShowCommand) => void) | null = null;
   private onAudienceCount: ((count: number) => void) | null = null;
+  private onAudioReady: ((filename: string, hash: string) => void) | null = null;
 
   constructor(onResync: OnResync, onStateChange: OnStateChange) {
     this.onResync = onResync;
@@ -79,6 +80,10 @@ export class SyncEngine {
 
   setAudienceCountHandler(fn: (count: number) => void) {
     this.onAudienceCount = fn;
+  }
+
+  setAudioReadyHandler(fn: (filename: string, hash: string) => void) {
+    this.onAudioReady = fn;
   }
 
   connect(wsUrl: string, showId: string): Promise<void> {
@@ -196,6 +201,13 @@ export class SyncEngine {
 
       case 'audience_count': {
         if (this.onAudienceCount) this.onAudienceCount(msg.count as number);
+        break;
+      }
+
+      case 'audio_ready': {
+        if (this.onAudioReady) {
+          this.onAudioReady(msg.audioFile as string, msg.audioHash as string);
+        }
         break;
       }
     }

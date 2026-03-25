@@ -339,17 +339,29 @@ async function joinShow() {
     // 1. Fetch show state to check if audio file is specified
     const stateRes = await fetch(`${serverBaseUrl}/api/show/${showId}/state`);
     if (!stateRes.ok) throw new Error(`Server error: ${stateRes.status}`);
-    const state = await stateRes.json() as { audioFile?: string; isPlaying: boolean; position: number };
+    const state = await stateRes.json() as {
+      audioFile?: string;
+      audioHash?: string;
+      audioReady?: boolean;
+      isPlaying: boolean;
+      position: number;
+    };
 
-    // 2. Check if we already have the audio stored locally
+    // 2. Check if we already have the audio stored locally (and if it matches the current hash)
     let audioData = await loadAudio(showId);
 
-    if (!audioData && state.audioFile) {
-      // 3. Download the audio file from R2 / server
+    // If we have cached audio but the hash has changed, discard the stale cache
+    if (audioData && state.audioHash && audioData.hash && audioData.hash !== state.audioHash) {
+      await deleteAudio(showId);
+      audioData = null;
+    }
+
+    if (!audioData && state.audioReady && state.audioFile) {
+      // 3. Download the audio file from R2 via the Worker
       const audioUrl = `${serverBaseUrl}/api/show/${showId}/audio`;
       const arrayBuffer = await downloadAudioFile(audioUrl, state.audioFile);
-      await saveAudio(showId, state.audioFile, arrayBuffer);
-      audioData = { filename: state.audioFile, data: arrayBuffer };
+      await saveAudio(showId, state.audioFile, arrayBuffer, state.audioHash || '');
+      audioData = { filename: state.audioFile, hash: state.audioHash || '', data: arrayBuffer };
     }
 
     // 4. Switch to player screen and init audio
@@ -383,6 +395,28 @@ async function joinShow() {
     });
 
     syncEngine.setShowCommandHandler(handleShowCommand);
+
+    // Handle audio_ready push — master uploaded a new audio file while we're connected
+    syncEngine.setAudioReadyHandler(async (filename: string, hash: string) => {
+      // Check if we already have this exact file
+      const existing = await loadAudio(showId);
+      if (existing && existing.hash === hash) return; // already have it
+
+      // Download the new audio file
+      setSyncStatus('syncing', 'Downloading audio…');
+      trackName.textContent = 'Downloading audio…';
+      try {
+        const audioUrl = `${serverBaseUrl}/api/show/${showId}/audio`;
+        const arrayBuffer = await downloadAudioFile(audioUrl, filename);
+        await saveAudio(showId, filename, arrayBuffer, hash);
+        await initAudio(arrayBuffer);
+        trackName.textContent = filename;
+        setupMediaSession(filename);
+        setSyncStatus('waiting', 'Audio ready — waiting for show');
+      } catch (err) {
+        setSyncStatus('waiting', 'Download failed — retry');
+      }
+    });
 
     await syncEngine.connect(wsUrl, showId);
     setSyncStatus('waiting', 'Waiting for show');
