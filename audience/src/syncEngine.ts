@@ -4,15 +4,19 @@
  * Implements NTP-style clock synchronisation over WebSocket.
  *
  * Algorithm:
- *  1. Every PING_INTERVAL ms, send { type: "ping", clientTs: Date.now() }
- *  2. Server responds with { type: "pong", clientTs, serverTs }
- *  3. RTT = Date.now() - clientTs
- *  4. Clock offset = serverTs - (clientTs + RTT/2)
- *     → positive offset means server clock is ahead of client clock
- *  5. We keep a rolling median of the last N offsets for stability
+ *  1. On connect, fire a rapid BURST of BURST_COUNT pings spaced BURST_INTERVAL_MS
+ *     apart. This quickly fills the offset history with high-quality samples before
+ *     any audio starts, averaging out asymmetric network paths.
+ *  2. After the burst, switch to slow KEEPALIVE pings every KEEPALIVE_INTERVAL_MS
+ *     to maintain the estimate and detect long-term drift.
+ *  3. Each pong: RTT = now - clientTs; offset = serverTs - (clientTs + RTT/2)
+ *  4. RTT outlier rejection: discard samples where RTT > median(RTT) * RTT_OUTLIER_FACTOR
+ *     (catches the occasional queued/delayed packet that would skew the estimate).
+ *  5. Rolling median of the last OFFSET_HISTORY_SIZE accepted samples.
+ *     Median is more robust than mean against the remaining outliers.
  *
  * Drift detection:
- *  - Every DRIFT_CHECK_INTERVAL ms, compare expected audio position
+ *  - Every DRIFT_CHECK_INTERVAL_MS, compare expected audio position
  *    (derived from last sync command + elapsed time) with actual audio position.
  *  - If drift > RESYNC_AHEAD_MS (150ms) or drift < -RESYNC_BEHIND_MS (300ms),
  *    trigger a resync by seeking the audio buffer.
@@ -24,6 +28,7 @@ export interface SyncState {
   driftMs: number;         // current audio drift in ms (positive = we're ahead)
   resyncs: number;
   lastSyncTs: number;
+  burstComplete: boolean;  // true once the startup burst has finished
 }
 
 export interface ShowCommand {
@@ -37,11 +42,26 @@ export interface ShowCommand {
 type OnResync = (targetPosition: number, play: boolean) => void;
 type OnStateChange = (state: SyncState) => void;
 
-const PING_INTERVAL_MS = 2000;
+// ── Tuning constants ──────────────────────────────────────────────────────────
+
+/** Number of rapid pings fired at startup to seed the offset estimate. */
+const BURST_COUNT = 12;
+/** Gap between burst pings in ms. 80ms gives ~1 second total burst time. */
+const BURST_INTERVAL_MS = 80;
+/** Slow keepalive ping interval after burst completes. */
+const KEEPALIVE_INTERVAL_MS = 5000;
+/** How often to check for audio drift. */
 const DRIFT_CHECK_INTERVAL_MS = 500;
-const RESYNC_AHEAD_MS = 150;    // resync if we're >150ms ahead of master
-const RESYNC_BEHIND_MS = 300;   // resync if we're >300ms behind master
-const OFFSET_HISTORY_SIZE = 8;  // rolling median window
+/** Resync if audience is more than this many ms AHEAD of master. */
+const RESYNC_AHEAD_MS = 150;
+/** Resync if audience is more than this many ms BEHIND master. */
+const RESYNC_BEHIND_MS = 300;
+/** Rolling median window size. Larger = more stable but slower to adapt. */
+const OFFSET_HISTORY_SIZE = 16;
+/** RTT history window for outlier detection. */
+const RTT_HISTORY_SIZE = 8;
+/** Discard a ping sample if its RTT is more than this multiple of the median RTT. */
+const RTT_OUTLIER_FACTOR = 2.5;
 
 export class SyncEngine {
   private ws: WebSocket | null = null;
@@ -49,10 +69,13 @@ export class SyncEngine {
   private driftTimer: ReturnType<typeof setInterval> | null = null;
 
   private offsetHistory: number[] = [];
+  private rttHistory: number[] = [];
   private clockOffsetMs = 0;
   private rttMs = 0;
   private driftMs = 0;
   private resyncs = 0;
+  private burstComplete = false;
+  private burstSent = 0;
 
   // Last known show command from master
   private lastCommand: ShowCommand | null = null;
@@ -97,7 +120,7 @@ export class SyncEngine {
           role: 'audience',
           clientId: `audience-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         }));
-        this.startPingLoop();
+        this.startBurst();
         this.startDriftCheckLoop();
         resolve();
       };
@@ -111,6 +134,9 @@ export class SyncEngine {
       this.ws.onerror = () => reject(new Error('WebSocket connection failed'));
       this.ws.onclose = () => {
         this.stopTimers();
+        // Reset burst state so reconnect fires a fresh burst
+        this.burstComplete = false;
+        this.burstSent = 0;
         // Attempt reconnect after 3 seconds
         setTimeout(() => {
           if (this.ws?.readyState === WebSocket.CLOSED) {
@@ -157,7 +183,76 @@ export class SyncEngine {
     return this.clockOffsetMs;
   }
 
-  // ── Private ──────────────────────────────────────────────────────────────────
+  /**
+   * Returns the estimated current master playback position in seconds,
+   * based on the last received command plus elapsed time.
+   * Returns null if no command has been received yet.
+   */
+  getEstimatedMasterPosition(): number | null {
+    if (!this.lastCommand) return null;
+    if (!this.isPlaying) return this.lastCommand.position;
+    const elapsedSec = (Date.now() - this.commandAppliedAt) / 1000;
+    return this.positionAtCommand + elapsedSec;
+  }
+
+  // ── Private ───────────────────────────────────────────────────────────────────
+
+  /**
+   * Fire a rapid burst of pings to seed the clock offset estimate quickly.
+   * After BURST_COUNT pings, switch to slow keepalive pings.
+   */
+  private startBurst() {
+    this.burstSent = 0;
+    this.burstComplete = false;
+
+    const firePing = () => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping', clientTs: Date.now() }));
+      }
+      this.burstSent++;
+      if (this.burstSent >= BURST_COUNT) {
+        // Burst complete — switch to slow keepalive
+        this.burstComplete = true;
+        this.startKeepalive();
+      } else {
+        this.pingTimer = setTimeout(firePing, BURST_INTERVAL_MS) as unknown as ReturnType<typeof setInterval>;
+      }
+    };
+
+    firePing();
+  }
+
+  private startKeepalive() {
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+    this.pingTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping', clientTs: Date.now() }));
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+  }
+
+  private startDriftCheckLoop() {
+    this.driftTimer = setInterval(() => {
+      if (!this.isPlaying || !this.lastCommand) return;
+
+      const drift = this.driftMs;
+      if (drift > RESYNC_AHEAD_MS || drift < -RESYNC_BEHIND_MS) {
+        // Calculate where we should be right now
+        const elapsedMs = Date.now() - this.commandAppliedAt;
+        const targetPosition = this.positionAtCommand + elapsedMs / 1000;
+        this.resyncs++;
+        this.onResync(targetPosition, this.isPlaying);
+        // Reset drift tracking after resync
+        this.notifyCommandApplied(targetPosition, this.isPlaying);
+        this.emitState();
+      }
+    }, DRIFT_CHECK_INTERVAL_MS);
+  }
+
+  private stopTimers() {
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+    if (this.driftTimer) { clearInterval(this.driftTimer); this.driftTimer = null; }
+  }
 
   private handleMessage(msg: Record<string, unknown>) {
     switch (msg.type) {
@@ -166,7 +261,24 @@ export class SyncEngine {
         const serverTs = msg.serverTs as number;
         const now = Date.now();
         const rtt = now - clientTs;
+
+        // RTT outlier rejection: if we have enough history and this RTT is
+        // suspiciously high (e.g. a queued/retransmitted packet), discard it.
+        if (this.rttHistory.length >= 4) {
+          const sortedRtt = [...this.rttHistory].sort((a, b) => a - b);
+          const medianRtt = sortedRtt[Math.floor(sortedRtt.length / 2)];
+          if (rtt > medianRtt * RTT_OUTLIER_FACTOR) {
+            // Outlier — update RTT display but don't use this offset sample
+            this.rttMs = rtt;
+            this.emitState();
+            break;
+          }
+        }
+
+        // Accept this sample
         this.rttMs = rtt;
+        this.addRttSample(rtt);
+
         const offset = serverTs - (clientTs + rtt / 2);
         this.addOffsetSample(offset);
         this.emitState();
@@ -185,11 +297,9 @@ export class SyncEngine {
 
         // Adjust position for network latency:
         // The command was sent at serverTs. It arrived now.
-        // Transit time = (Date.now() - serverTs) - clockOffset
-        // But we already account for clock offset, so:
+        // Use the clock-offset-corrected transit time.
         const transitMs = (Date.now() - cmd.serverTs) - this.clockOffsetMs;
         if (cmd.action === 'play') {
-          // Advance position by transit time so we start at the right spot
           cmd.position += Math.max(0, transitMs) / 1000;
         }
 
@@ -213,35 +323,11 @@ export class SyncEngine {
     }
   }
 
-  private startPingLoop() {
-    this.pingTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'ping', clientTs: Date.now() }));
-      }
-    }, PING_INTERVAL_MS);
-  }
-
-  private startDriftCheckLoop() {
-    this.driftTimer = setInterval(() => {
-      if (!this.isPlaying || !this.lastCommand) return;
-
-      const drift = this.driftMs;
-      if (drift > RESYNC_AHEAD_MS || drift < -RESYNC_BEHIND_MS) {
-        // Calculate where we should be right now
-        const elapsedMs = Date.now() - this.commandAppliedAt;
-        const targetPosition = this.positionAtCommand + elapsedMs / 1000;
-        this.resyncs++;
-        this.onResync(targetPosition, this.isPlaying);
-        // Reset drift after resync
-        this.notifyCommandApplied(targetPosition, this.isPlaying);
-        this.emitState();
-      }
-    }, DRIFT_CHECK_INTERVAL_MS);
-  }
-
-  private stopTimers() {
-    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
-    if (this.driftTimer) { clearInterval(this.driftTimer); this.driftTimer = null; }
+  private addRttSample(rtt: number) {
+    this.rttHistory.push(rtt);
+    if (this.rttHistory.length > RTT_HISTORY_SIZE) {
+      this.rttHistory.shift();
+    }
   }
 
   private addOffsetSample(offset: number) {
@@ -249,7 +335,7 @@ export class SyncEngine {
     if (this.offsetHistory.length > OFFSET_HISTORY_SIZE) {
       this.offsetHistory.shift();
     }
-    // Use median for stability (resistant to outliers)
+    // Use median for stability (resistant to remaining outliers)
     const sorted = [...this.offsetHistory].sort((a, b) => a - b);
     this.clockOffsetMs = sorted[Math.floor(sorted.length / 2)];
   }
@@ -261,6 +347,7 @@ export class SyncEngine {
       driftMs: this.driftMs,
       resyncs: this.resyncs,
       lastSyncTs: Date.now(),
+      burstComplete: this.burstComplete,
     });
   }
 }

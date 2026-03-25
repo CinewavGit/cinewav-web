@@ -13,6 +13,14 @@
 import { SyncEngine, ShowCommand } from './syncEngine';
 import { saveAudio, loadAudio } from './audioStorage';
 
+// ── Manual Sync DOM Elements ────────────────────────────────────────────────
+const syncControlsEl = document.getElementById('sync-controls')!;
+const resyncBtn      = document.getElementById('resync-btn') as HTMLButtonElement;
+const ftMinus        = document.getElementById('ft-minus') as HTMLButtonElement;
+const ftPlus         = document.getElementById('ft-plus') as HTMLButtonElement;
+const ftReset        = document.getElementById('ft-reset') as HTMLButtonElement;
+const ftValue        = document.getElementById('ft-value')!;
+
 // ── DOM ───────────────────────────────────────────────────────────────────────
 const screens = {
   join: document.getElementById('screen-join')!,
@@ -55,6 +63,36 @@ let uiInterval: ReturnType<typeof setInterval> | null = null;
 let showId = '';
 let serverBaseUrl = '';
 let syncEngine: SyncEngine | null = null;
+
+/**
+ * manualOffsetMs — user-controlled timing adjustment applied on every
+ * startPlayback() call.
+ * Positive value = audio is perceived as late → shift start position forward
+ *   (play from slightly later in the file, so audio catches up to video).
+ * Negative value = audio is perceived as early → shift start position back.
+ *
+ * Stored in localStorage so it persists across page reloads for the same show.
+ */
+let manualOffsetMs = 0;
+
+function loadManualOffset() {
+  const saved = localStorage.getItem(`cinewav_offset_${showId}`);
+  manualOffsetMs = saved ? parseInt(saved, 10) : 0;
+  renderOffsetDisplay();
+}
+
+function saveManualOffset() {
+  localStorage.setItem(`cinewav_offset_${showId}`, String(manualOffsetMs));
+  renderOffsetDisplay();
+}
+
+function renderOffsetDisplay() {
+  ftValue.textContent = (manualOffsetMs >= 0 ? '+' : '') + String(manualOffsetMs);
+  ftValue.style.color =
+    manualOffsetMs === 0 ? 'var(--text-muted)' :
+    manualOffsetMs > 0   ? 'var(--warning)' :
+                           'var(--success)';
+}
 
 // ── Screen Management ─────────────────────────────────────────────────────────
 function showScreen(name: keyof typeof screens) {
@@ -149,7 +187,10 @@ function startPlayback(fromPosition: number) {
   if (!audioCtx || !audioBuffer) return;
   stopPlayback();
 
-  const clampedPos = Math.max(0, Math.min(fromPosition, audioDuration - 0.1));
+  // Apply the manual offset: positive offset means audio is late,
+  // so we advance the start position by that amount to compensate.
+  const adjustedPosition = fromPosition + (manualOffsetMs / 1000);
+  const clampedPos = Math.max(0, Math.min(adjustedPosition, audioDuration - 0.1));
   sourceNode = audioCtx.createBufferSource();
   sourceNode.buffer = audioBuffer;
   sourceNode.connect(audioCtx.destination);
@@ -318,7 +359,66 @@ function handleResync(targetPosition: number, play: boolean) {
   }
 }
 
-// ── Join Flow ─────────────────────────────────────────────────────────────────
+//// ── Manual Sync Controls ─────────────────────────────────────────────────────────────
+
+/**
+ * Perform an immediate manual resync: ask the sync engine for the current
+ * master position and restart playback from there, applying the manual offset.
+ */
+function doManualResync() {
+  if (!syncEngine || !audioCtx || !audioBuffer) return;
+
+  const masterPos = syncEngine.getEstimatedMasterPosition();
+  if (masterPos === null) return;
+
+  const wasPlaying = isPlaying;
+  stopPlayback();
+  if (wasPlaying) {
+    startPlayback(masterPos);
+    setSyncStatus('synced', 'Resynced');
+  } else {
+    playStartPos = masterPos + (manualOffsetMs / 1000);
+    setSyncStatus('synced', 'Paused');
+  }
+}
+
+resyncBtn.addEventListener('click', () => {
+  if (audioCtx?.state === 'suspended') audioCtx.resume();
+  doManualResync();
+  // Brief visual feedback
+  resyncBtn.textContent = '✓ Synced!';
+  setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
+});
+
+ftMinus.addEventListener('click', () => {
+  manualOffsetMs -= 50;
+  saveManualOffset();
+  // If currently playing, apply the new offset immediately
+  if (isPlaying && syncEngine) {
+    const masterPos = syncEngine.getEstimatedMasterPosition();
+    if (masterPos !== null) startPlayback(masterPos);
+  }
+});
+
+ftPlus.addEventListener('click', () => {
+  manualOffsetMs += 50;
+  saveManualOffset();
+  if (isPlaying && syncEngine) {
+    const masterPos = syncEngine.getEstimatedMasterPosition();
+    if (masterPos !== null) startPlayback(masterPos);
+  }
+});
+
+ftReset.addEventListener('click', () => {
+  manualOffsetMs = 0;
+  saveManualOffset();
+  if (isPlaying && syncEngine) {
+    const masterPos = syncEngine.getEstimatedMasterPosition();
+    if (masterPos !== null) startPlayback(masterPos);
+  }
+});
+
+// ── Join Flow ─────────────────────────────────────────────────────────────
 async function joinShow() {
   showId = joinShowIdInput.value.trim();
   serverBaseUrl = joinServerUrlInput.value.trim().replace(/\/$/, '');
@@ -369,6 +469,11 @@ async function joinShow() {
     showIdDisplay.textContent = `Show: ${showId}`;
     setupMediaSession(audioData?.filename || 'Cinewav Show');
     startSilentAudio();
+
+    // Show manual sync controls and load saved offset for this show
+    syncControlsEl.style.display = 'flex';
+    loadManualOffset();
+    resyncBtn.disabled = false;
 
     if (audioData) {
       await initAudio(audioData.data);

@@ -391,6 +391,103 @@
       margin-top: 8px;
     }
 
+    /* ── Manual Sync Controls ── */
+    .sync-controls {
+      width: 100%;
+      max-width: 320px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    /* RESYNC button */
+    .btn-resync {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 12px;
+      background: var(--accent);
+      color: white;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .btn-resync:active { transform: scale(0.97); background: var(--accent-hover, #8b85ff); }
+    .btn-resync:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    /* Fine-tune row */
+    .fine-tune-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px;
+    }
+
+    .fine-tune-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    .fine-tune-btn {
+      flex-shrink: 0;
+      width: 44px;
+      height: 44px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface2);
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.12s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .fine-tune-btn:active { background: var(--accent); border-color: var(--accent); transform: scale(0.93); }
+
+    .fine-tune-display {
+      flex: 1;
+      text-align: center;
+      font-size: 18px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--accent);
+      line-height: 1;
+    }
+
+    .fine-tune-display .ft-unit {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: block;
+      margin-top: 2px;
+      font-weight: 400;
+    }
+
+    .btn-reset-offset {
+      flex-shrink: 0;
+      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.12s;
+    }
+    .btn-reset-offset:active { color: var(--danger); border-color: var(--danger); }
+
     /* Error screen */
     #screen-error {
       align-items: center;
@@ -468,6 +565,26 @@
         <div class="seek-times">
           <span id="p-current-time">0:00</span>
           <span id="p-total-time">0:00</span>
+        </div>
+      </div>
+
+      <!-- Manual Sync Controls -->
+      <div class="sync-controls" id="sync-controls" style="display:none">
+        <!-- RESYNC button -->
+        <button class="btn-resync" id="resync-btn" disabled>
+          <span>&#8635;</span> Resync Now
+        </button>
+
+        <!-- Fine-tune offset -->
+        <div class="fine-tune-row">
+          <span class="fine-tune-label">Fine Tune</span>
+          <button class="fine-tune-btn" id="ft-minus" aria-label="Shift audio earlier by 50ms">−50ms</button>
+          <div class="fine-tune-display">
+            <span id="ft-value">0</span>
+            <span class="ft-unit">ms offset</span>
+          </div>
+          <button class="fine-tune-btn" id="ft-plus" aria-label="Shift audio later by 50ms">+50ms</button>
+          <button class="btn-reset-offset" id="ft-reset">Reset</button>
         </div>
       </div>
 
