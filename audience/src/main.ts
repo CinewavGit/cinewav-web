@@ -280,16 +280,21 @@ function attachAudioContextListeners(ctx: AudioContext) {
     if (ctx.state === 'running') {
       // Restart silent keepalive on the resumed/new context
       startSilentKeepalive();
-      // Context just became active — restart any deferred playback
-      if (pendingPlaybackPos !== null) {
+      // Context just became active — restart playback from the current master
+      // position. Always recalculate from master rather than using a stale
+      // pendingPlaybackPos, because the context may have been suspended for
+      // several seconds and the stored position would be wrong.
+      if (masterIsPlaying && audioBuffer) {
+        pendingPlaybackPos = null;
+        const targetRaw = getEstimatedMasterPosition();
+        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      } else if (pendingPlaybackPos !== null) {
+        // Not playing per master but we have a deferred position (e.g. manual
+        // play button pressed while context was suspended) — honour it.
         const pos = pendingPlaybackPos;
         pendingPlaybackPos = null;
         startPlayback(pos);
-        setSyncStatus('synced', 'In sync');
-      } else if (isPlaying) {
-        // We were playing but context was interrupted — resync to master
-        const targetRaw = getEstimatedMasterPosition();
-        startPlayback(targetRaw - (manualOffsetMs / 1000));
         setSyncStatus('synced', 'In sync');
       }
     }
@@ -364,6 +369,9 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
   pTotalTime.textContent = formatTime(audioDuration);
   playPauseBtn.disabled  = false;
   resyncBtn.disabled     = false;
+  // Android fix C: start the health-check timer that recovers from silent
+  // AudioContext suspension (statechange may not fire on Android Chrome).
+  startHealthCheck();
 }
 
 /**
@@ -410,9 +418,27 @@ function getEstimatedMasterPosition(): number {
 /**
  * Start playback from rawPosition (seconds, WITHOUT manual offset applied).
  * manualOffsetMs is applied internally.
+ *
+ * Android fix: if the AudioContext is not running (suspended/interrupted),
+ * defer playback via pendingPlaybackPos instead of starting a node on a
+ * suspended context. A node started on a suspended context produces no audio
+ * and — critically — audioCtx.currentTime is frozen, so playStartCtxTime is
+ * recorded at the wrong value. When the context later resumes, currentTime
+ * jumps forward and getCurrentPosition() wildly overshoots, breaking all
+ * subsequent drift calculations permanently.
  */
 function startPlayback(rawPosition: number) {
   if (!audioCtx || !audioBuffer) return;
+
+  // Android fix A: never start a node on a non-running context.
+  // Defer and let the statechange handler (or the health-check timer) restart
+  // playback once the context is actually running.
+  if (audioCtx.state !== 'running') {
+    pendingPlaybackPos = rawPosition - (manualOffsetMs / 1000);
+    // Kick a resume attempt — statechange will fire startPlayback when ready
+    resumeAudioContext().catch(() => {});
+    return;
+  }
 
   // Stop existing node cleanly
   const oldNode = sourceNode;
@@ -450,7 +476,7 @@ function startPlayback(rawPosition: number) {
   };
 
   sourceNode       = node;
-  playStartCtxTime = audioCtx.currentTime;
+  playStartCtxTime = audioCtx.currentTime;  // safe: context is running
   playStartPos     = clamped;
   isPlaying        = true;
 
@@ -499,6 +525,16 @@ function startDriftLoop() {
   driftInterval = setInterval(() => {
     if (!isPlaying || !masterIsPlaying) return;
 
+    // Android fix B: if the AudioContext is not running, the Web Audio clock
+    // (audioCtx.currentTime) is frozen. getCurrentPosition() will return a
+    // stale value and all drift calculations will be wrong. Skip this tick
+    // and kick a resume attempt instead. The statechange handler (or the
+    // health-check timer) will restart playback when the context recovers.
+    if (!audioCtx || audioCtx.state !== 'running') {
+      resumeAudioContext().catch(() => {});
+      return;
+    }
+
     const actualPos   = getCurrentPosition();
     const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
     driftMs = (actualPos - expectedPos) * 1000;
@@ -524,6 +560,35 @@ function startDriftLoop() {
       driftOutOfRangeCount = 0;
     }
   }, DRIFT_CHECK_MS);
+}
+
+// ── AudioContext Health-Check Timer (Android silent-suspend recovery) ─────────
+// Android Chrome can silently suspend the AudioContext after rapid seek cycles
+// without firing a statechange event. This timer polls every 2 seconds and
+// forces a resume + playback restart if the context is not running while the
+// show is supposed to be playing. It is the safety net for the cases where
+// statechange never fires.
+let healthCheckInterval: ReturnType<typeof setInterval> | null = null;
+
+function startHealthCheck() {
+  if (healthCheckInterval) clearInterval(healthCheckInterval);
+  healthCheckInterval = setInterval(async () => {
+    if (!audioCtx || !masterIsPlaying || !audioBuffer) return;
+    if (audioCtx.state === 'running') return; // all good
+
+    // Context is not running while it should be — attempt recovery
+    setSyncStatus('drifted', 'Recovering audio…');
+    try {
+      await resumeAudioContext();
+    } catch { /* ignore */ }
+
+    // If context is now running and we're not playing, restart from master pos
+    if (audioCtx.state === 'running' && !isPlaying) {
+      const targetRaw = getEstimatedMasterPosition();
+      startPlayback(targetRaw - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'In sync');
+    }
+  }, 2000);
 }
 
 // ── Media Session ─────────────────────────────────────────────────────────────
