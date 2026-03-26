@@ -1,42 +1,41 @@
 /**
- * Cinewav Audience PWA — Main App v6
+ * Cinewav Audience PWA — Main App v7
  *
- * SPEC:
- *  - Join at any time and find sync quickly
- *  - Stay in sync via drift detection every 500ms
- *  - Hard resync if drift > +150ms (ahead) or > -300ms (behind)
- *  - Continue playing through screen lock on iOS and Android
- *  - Respond to all master commands: play, pause, seek, restart
- *  - RESYNC button forces immediate hard resync
- *  - Fine-tune buttons shift audio immediately by ±100ms
- *  - Session never closes — always listening for commands
+ * Base: v4 AudioBufferSourceNode architecture (known working)
  *
- * PLAYBACK ENGINE: HTMLAudioElement (Blob URL)
- *  - Persistent element, never recreated
- *  - Survives screen lock on iOS and Android natively
- *  - .currentTime is always writable — seek, restart, fine-tune all work
+ * Three targeted fixes on top of v4:
  *
- * DRIFT CORRECTION:
- *  - Measured every 500ms against getEstimatedMasterPosition()
- *  - Ahead by >150ms OR behind by >300ms → hard seek to correct position
- *  - 3-second cooldown between automatic resyncs to avoid thrash
- *  - NO playbackRate nudging — causes iOS re-buffer glitches
+ * FIX 1 — masterPositionAt clock source
+ *   v4 used cmd.receivedAt (Service Worker thread clock) for masterPositionAt.
+ *   The drift loop uses Date.now() (main thread clock). On iOS these two threads
+ *   can have measurable skew, especially when screen-locked. Fix: always set
+ *   masterPositionAt = Date.now() on the main thread.
  *
- * CLOCK SYNC: NTP-style via Service Worker WebSocket pings
- *  - masterPosition + (Date.now() - masterPositionAt) / 1000
- *  - masterPositionAt is set from cmd.receivedAt (SW-corrected timestamp)
+ * FIX 2 — Drift loop consecutive-check guard
+ *   v4 triggered a hard resync on a single out-of-range drift reading. A single
+ *   noisy ping sample could cause a spurious resync glitch. Fix: require 2
+ *   consecutive out-of-range readings before auto-resyncing.
+ *
+ * FIX 3 — iOS background audio keepalive without silent.mp3 loop
+ *   v4 used a looping silent.mp3 HTMLAudioElement to keep the iOS audio session
+ *   alive. This caused 1-second interruptions because each loop iteration was
+ *   treated as a new audio event by the OS. Fix: use a looping
+ *   AudioBufferSourceNode of silence connected to the AudioContext destination.
+ *   This keeps the AudioContext alive without triggering OS media events.
+ *
+ * Everything else is identical to v4.
  */
 
 import { saveAudio, loadAudio } from './audioStorage';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface ShowCommand {
-  action:       'play' | 'pause' | 'seek' | 'load';
-  position:     number;       // seconds, transit-corrected
-  serverTs:     number;
-  masterTs:     number;
-  audioFile:    string | null;
-  receivedAt:   number;       // client wall-clock ms when SW received this
+  action:    'play' | 'pause' | 'seek' | 'load';
+  position:  number;
+  serverTs:  number;
+  masterTs:  number;
+  audioFile: string | null;
+  receivedAt: number;
   clockOffsetMs: number;
 }
 
@@ -77,61 +76,46 @@ const ftReset            = document.getElementById('ft-reset')         as HTMLBu
 const ftValue            = document.getElementById('ft-value')!;
 
 // ── App State ─────────────────────────────────────────────────────────────────
+let audioCtx:        AudioContext | null          = null;
+let audioBuffer:     AudioBuffer  | null          = null;
+let sourceNode:      AudioBufferSourceNode | null = null;
+let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepalive
+let isPlaying        = false;
+let playStartCtxTime = 0;   // audioCtx.currentTime when playback started
+let playStartPos     = 0;   // audio position (seconds) when playback started
+let audioDuration    = 0;
+let uiInterval:      ReturnType<typeof setInterval> | null = null;
+let driftInterval:   ReturnType<typeof setInterval> | null = null;
+let showId           = '';
+let serverBaseUrl    = '';
+let manualOffsetMs   = 0;
 
-// Persistent audio element — created once on first audio load, never destroyed.
-let audioEl:      HTMLAudioElement | null = null;
-let audioBlobUrl: string | null           = null;
-let audioDuration = 0;
+// Clock state (updated from Service Worker)
+let clockOffsetMs    = 0;
+let rttMs            = 0;
+let resyncs          = 0;
+let driftMs          = 0;
 
-// isPlaying: true only when WE have called audioEl.play() and it resolved.
-// Set to false before audioEl.pause() so the 'pause' event listener
-// can distinguish our own pauses from external OS interruptions.
-let isPlaying = false;
-
-// isSeekingInternal: true during the pause+seek+play sequence inside
-// startPlayback(), so the 'pause' event listener ignores our internal pause.
-let isSeekingInternal = false;
-
-// Manual fine-tune offset (persisted per show in localStorage)
-let manualOffsetMs = 0;
-
-// Show / server info
-let showId        = '';
-let serverBaseUrl = '';
-
-// Clock state (updated from Service Worker NTP pings)
-let clockOffsetMs = 0;
-let rttMs         = 0;
-
-// Stats for display
-let resyncs = 0;
-let driftMs = 0;
-
-// Master state — updated on every command received from the server.
-// getEstimatedMasterPosition() uses these to compute where the master is NOW.
+// Master state (last known from Service Worker)
 let masterIsPlaying  = false;
-let masterPosition   = 0;      // seconds at time of last command
-let masterPositionAt = 0;      // Date.now() when masterPosition was last set
+let masterPosition   = 0;
+let masterPositionAt = 0;   // Date.now() on main thread — FIX 1
 
-// Pending command received before audio was loaded
+// Pending command received before audio was decoded
 let pendingCommand: ShowCommand | null = null;
+
+// Pending playback start deferred until AudioContext resumes
+let pendingPlaybackPos: number | null = null;
+
+// Raw audio ArrayBuffer kept in memory so we can re-decode if AudioContext is closed
+let rawAudioData: ArrayBuffer | null = null;
+
+// FIX 2: consecutive out-of-range drift readings required before auto-resync
+let driftOutOfRangeCount = 0;
+const DRIFT_CONFIRM_COUNT = 2;
 
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
-
-// Drift loop
-let uiInterval:    ReturnType<typeof setInterval> | null = null;
-let driftInterval: ReturnType<typeof setInterval> | null = null;
-
-// Drift thresholds (per spec)
-const DRIFT_CHECK_MS        = 500;   // check every 500ms
-const RESYNC_AHEAD_MS       = 150;   // resync if >150ms ahead of master
-const RESYNC_BEHIND_MS      = 300;   // resync if >300ms behind master
-const RESYNC_COOLDOWN_MS    = 3000;  // minimum 3s between automatic resyncs
-const RESYNC_CONFIRM_CHECKS = 2;     // require N consecutive out-of-range readings before resyncing
-                                     // prevents a single noisy clock reading from triggering a glitch
-let   lastResyncAt          = 0;
-let   driftOutOfRangeCount  = 0;     // consecutive out-of-range drift readings
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatTime(s: number): string {
@@ -234,197 +218,207 @@ async function downloadAudioFile(url: string, filename: string): Promise<ArrayBu
 // ── Audio Engine ──────────────────────────────────────────────────────────────
 
 /**
- * Detect MIME type from first 12 bytes of the audio file.
+ * Attach the statechange listener to an AudioContext.
+ * Extracted so it can be re-attached when the context is recreated.
  */
-function detectMimeType(arrayBuffer: ArrayBuffer): string {
-  const h = new Uint8Array(arrayBuffer, 0, 12);
-  // MP4/M4A: 'ftyp' at byte 4
-  if (h[4]===0x66 && h[5]===0x74 && h[6]===0x79 && h[7]===0x70) return 'audio/mp4';
-  // MP4/M4A: 'ftyp' at byte 0 (some variants)
-  if (h[0]===0x66 && h[1]===0x74 && h[2]===0x79 && h[3]===0x70) return 'audio/mp4';
-  // OGG: 'OggS'
-  if (h[0]===0x4F && h[1]===0x67 && h[2]===0x67 && h[3]===0x53) return 'audio/ogg';
-  // Default: MP3
-  return 'audio/mpeg';
-}
-
-/**
- * Initialize the persistent HTMLAudioElement from an ArrayBuffer.
- * Creates a Blob URL so the OS treats it as a real audio file.
- * Called once; subsequent seeks use audioEl.currentTime directly.
- */
-async function initAudio(arrayBuffer: ArrayBuffer): Promise<void> {
-  if (audioBlobUrl) {
-    URL.revokeObjectURL(audioBlobUrl);
-    audioBlobUrl = null;
-  }
-
-  const mimeType = detectMimeType(arrayBuffer);
-  const blob = new Blob([arrayBuffer], { type: mimeType });
-  audioBlobUrl = URL.createObjectURL(blob);
-
-  if (!audioEl) {
-    audioEl = new Audio();
-    audioEl.preload = 'auto';
-
-    // ── ended: film finished naturally ──────────────────────────────────────
-    audioEl.addEventListener('ended', () => {
-      // Mark as not playing so the drift loop and visibility handler know
-      // to restart when the master sends a new play command.
-      // Do NOT clear masterIsPlaying — the master may still be "playing"
-      // (e.g. it looped or restarted) and we need to respond to its commands.
-      isPlaying = false;
-      albumArt.classList.remove('playing');
-      stopLoops();
-      updatePlayPauseBtn();
-      updateMediaSession();
-      setSyncStatus('synced', 'Show ended — waiting for master');
-    });
-
-    // ── pause: fired by OS (screen lock, phone call, Bluetooth) ────────────
-    // We distinguish external OS pauses from our own internal pauses:
-    //  - stopPlayback() sets isPlaying=false BEFORE calling audioEl.pause()
-    //    → isPlaying is already false here → if(isPlaying) is a no-op
-    //  - startPlayback() sets isSeekingInternal=true before its internal pause()
-    //    → early return via isSeekingInternal check
-    // Only genuine external interruptions reach the body of this handler.
-    audioEl.addEventListener('pause', () => {
-      if (isSeekingInternal) return;
-      if (isPlaying) {
-        // External OS interruption — mark state so visibilitychange can recover
-        isPlaying = false;
-        albumArt.classList.remove('playing');
-        stopLoops();
-        updatePlayPauseBtn();
-        updateMediaSession();
-        setSyncStatus('drifted', 'Audio interrupted');
+function attachAudioContextListeners(ctx: AudioContext) {
+  ctx.addEventListener('statechange', () => {
+    // Ignore events from stale (replaced) contexts
+    if (ctx !== audioCtx) return;
+    if (ctx.state === 'running') {
+      // Restart silent keepalive on the resumed/new context
+      startSilentKeepalive();
+      // Context just became active — restart any deferred playback
+      if (pendingPlaybackPos !== null) {
+        const pos = pendingPlaybackPos;
+        pendingPlaybackPos = null;
+        startPlayback(pos);
+        setSyncStatus('synced', 'In sync');
+      } else if (isPlaying) {
+        // We were playing but context was interrupted — resync to master
+        const targetRaw = getEstimatedMasterPosition();
+        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
       }
-    });
-
-    // ── loadedmetadata: update duration display ─────────────────────────────
-    audioEl.addEventListener('loadedmetadata', () => {
-      audioDuration = audioEl!.duration;
-      pTotalTime.textContent = formatTime(audioDuration);
-    });
-  }
-
-  audioEl.src = audioBlobUrl;
-
-  // Wait for metadata so we have the correct duration
-  await new Promise<void>((resolve) => {
-    if (audioEl!.readyState >= 1) {
-      audioDuration = audioEl!.duration;
-      pTotalTime.textContent = formatTime(audioDuration);
-      resolve();
-      return;
     }
-    audioEl!.addEventListener('loadedmetadata', () => {
-      audioDuration = audioEl!.duration;
-      pTotalTime.textContent = formatTime(audioDuration);
-      resolve();
-    }, { once: true });
-    audioEl!.addEventListener('error', () => resolve(), { once: true });
   });
-
-  playPauseBtn.disabled = false;
-  resyncBtn.disabled    = false;
 }
 
-// ── Position Estimation ───────────────────────────────────────────────────────
+function ensureAudioContext() {
+  // Create a new context if none exists OR if the existing one is closed.
+  // Android Chrome closes (not just suspends) the AudioContext when the film
+  // ends while the screen is off. A closed context cannot be resumed.
+  if (!audioCtx || audioCtx.state === 'closed') {
+    if (sourceNode) {
+      try { sourceNode.stop(); } catch { /* already stopped */ }
+      sourceNode = null;
+    }
+    if (keepaliveNode) {
+      try { keepaliveNode.stop(); } catch { /* already stopped */ }
+      keepaliveNode = null;
+    }
+    isPlaying = false;
+    audioCtx = new AudioContext();
+    attachAudioContextListeners(audioCtx);
+  }
+}
 
 /**
- * Estimate where the master player is RIGHT NOW, in seconds.
- * masterPosition and masterPositionAt are updated on every command received.
+ * Resume AudioContext regardless of whether it is 'suspended' or 'interrupted'.
+ * On iOS, the state after screen-lock is 'interrupted', not 'suspended'.
+ * On Android, the context may be 'closed' after the film ends with screen off —
+ * in that case we recreate it and re-decode the audio buffer.
+ */
+async function resumeAudioContext(): Promise<void> {
+  if (!audioCtx) return;
+
+  if (audioCtx.state === 'closed') {
+    ensureAudioContext();
+    // Re-decode audio buffer for the new context if we have the raw data
+    if (rawAudioData && audioCtx) {
+      try {
+        audioBuffer = await audioCtx.decodeAudioData(rawAudioData.slice(0));
+        audioDuration = audioBuffer.duration;
+      } catch { /* decode failed */ }
+    }
+    return;
+  }
+
+  if (audioCtx.state === 'suspended' || (audioCtx.state as string) === 'interrupted') {
+    try { await audioCtx.resume(); } catch { /* ignore */ }
+  }
+}
+
+async function initAudio(arrayBuffer: ArrayBuffer) {
+  ensureAudioContext();
+  await resumeAudioContext();
+  // Keep a copy of the raw bytes so we can re-decode if the AudioContext is
+  // recreated later (e.g. Android closes it when screen-off + film ends).
+  rawAudioData  = arrayBuffer.slice(0);
+  audioBuffer   = await audioCtx!.decodeAudioData(arrayBuffer.slice(0));
+  audioDuration = audioBuffer.duration;
+  pTotalTime.textContent = formatTime(audioDuration);
+  playPauseBtn.disabled  = false;
+  resyncBtn.disabled     = false;
+}
+
+/**
+ * FIX 3: Silent keepalive using AudioBufferSourceNode.
+ * Keeps the AudioContext alive on iOS when screen is locked — without using
+ * a looping HTMLAudioElement (which caused 1-second OS media interruptions).
+ * A looping silent AudioBufferSourceNode is invisible to the OS media session.
+ */
+function startSilentKeepalive() {
+  if (!audioCtx || audioCtx.state !== 'running') return;
+  if (keepaliveNode) {
+    try { keepaliveNode.stop(); } catch { /* already stopped */ }
+    keepaliveNode = null;
+  }
+  const sampleRate = audioCtx.sampleRate;
+  const silentBuf  = audioCtx.createBuffer(1, sampleRate, sampleRate);
+  const node = audioCtx.createBufferSource();
+  node.buffer = silentBuf;
+  node.loop   = true;
+  node.connect(audioCtx.destination);
+  node.start(0);
+  keepaliveNode = node;
+}
+
+/**
+ * Returns current playback position in seconds using the Web Audio clock.
+ * audioCtx.currentTime is a hardware-backed monotonic timer — immune to
+ * browser throttling and system clock adjustments.
+ */
+function getCurrentPosition(): number {
+  if (!audioCtx || !isPlaying) return playStartPos;
+  return playStartPos + (audioCtx.currentTime - playStartCtxTime);
+}
+
+/**
+ * Estimate where the master player is RIGHT NOW.
+ * Uses Date.now() since masterPositionAt was recorded on the main thread (FIX 1).
  */
 function getEstimatedMasterPosition(): number {
   if (!masterIsPlaying) return masterPosition;
   return masterPosition + (Date.now() - masterPositionAt) / 1000;
 }
 
-// ── Playback Control ──────────────────────────────────────────────────────────
+/**
+ * Start playback from rawPosition (seconds, WITHOUT manual offset applied).
+ * manualOffsetMs is applied internally.
+ */
+function startPlayback(rawPosition: number) {
+  if (!audioCtx || !audioBuffer) return;
 
-function stopLoops() {
+  // Stop existing node cleanly
+  const oldNode = sourceNode;
+  sourceNode = null;
+  if (oldNode) {
+    try { oldNode.stop(); } catch { /* already stopped */ }
+    oldNode.disconnect();
+  }
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
-}
-
-/**
- * Stop playback cleanly.
- * Sets isPlaying=false BEFORE calling audioEl.pause() so the 'pause' event
- * listener sees isPlaying=false and treats it as an internal pause (no-op).
- */
-function stopPlayback() {
   isPlaying = false;
-  stopLoops();
-  if (audioEl) {
-    audioEl.pause();
-  }
-  albumArt.classList.remove('playing');
-  updatePlayPauseBtn();
-  updateMediaSession();
-}
 
-/**
- * Seek to rawPosition (seconds, WITHOUT manual offset) and start playing.
- * manualOffsetMs is applied internally.
- *
- * Safe to call while already playing — always pauses first to avoid iOS
- * AbortError from seek-while-playing.
- */
-async function startPlayback(rawPosition: number): Promise<void> {
-  if (!audioEl || audioDuration === 0) return;
-
-  stopLoops();
-
-  const adjusted = rawPosition + (manualOffsetMs / 1000);
-  const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.05));
-
-  // Guard the 'pause' event listener during our internal pause+seek sequence
-  isSeekingInternal = true;
-  audioEl.pause();
-  audioEl.currentTime = clamped;
-
-  try {
-    await audioEl.play();
-  } catch (err: unknown) {
-    isSeekingInternal = false;
-    if (err instanceof Error && err.name === 'AbortError') {
-      // A newer play() call superseded this one — safe to ignore
-      return;
-    }
-    if (err instanceof Error && err.name === 'NotAllowedError') {
-      // Needs a user gesture — show tap-to-play prompt
-      isPlaying = false;
-      updatePlayPauseBtn();
-      setSyncStatus('syncing', 'Tap play to start');
-      return;
-    }
-    console.warn('[Audio] play() error:', err);
-    return;
-  }
-
-  isSeekingInternal = false;
-
-  // Reset the resync cooldown and consecutive-drift counter from NOW so the
-  // drift loop doesn't immediately fire again after we just seeked.
-  lastResyncAt         = Date.now();
+  // FIX 2: reset consecutive drift counter on every new playback start
   driftOutOfRangeCount = 0;
 
-  isPlaying = true;
+  const adjusted = rawPosition + (manualOffsetMs / 1000);
+  const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.1));
+
+  const node = audioCtx.createBufferSource();
+  node.buffer = audioBuffer;
+  node.connect(audioCtx.destination);
+  node.start(0, clamped);
+
+  node.onended = () => {
+    if (sourceNode === node) {
+      sourceNode = null;
+      isPlaying  = false;
+      albumArt.classList.remove('playing');
+      if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
+      if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
+      driftOutOfRangeCount = 0;
+      updatePlayPauseBtn();
+      if (!masterIsPlaying) setSyncStatus('synced', 'Show ended');
+    }
+  };
+
+  sourceNode       = node;
+  playStartCtxTime = audioCtx.currentTime;
+  playStartPos     = clamped;
+  isPlaying        = true;
+
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
   updatePlayPauseBtn();
-  updateMediaSession();
   startUILoop();
   startDriftLoop();
+  updateMediaSession();
+}
+
+function stopPlayback() {
+  const node = sourceNode;
+  sourceNode = null;
+  if (node) {
+    try { node.stop(); } catch { /* already stopped */ }
+    node.disconnect();
+  }
+  if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
+  if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
+  isPlaying = false;
+  driftOutOfRangeCount = 0;
+  albumArt.classList.remove('playing');
+  updatePlayPauseBtn();
 }
 
 // ── UI Loop ───────────────────────────────────────────────────────────────────
 function startUILoop() {
   if (uiInterval) clearInterval(uiInterval);
   uiInterval = setInterval(() => {
-    if (!audioEl || !isPlaying) return;
-    const pos     = audioEl.currentTime;
+    if (!isPlaying) return;
+    const pos     = getCurrentPosition();
     const clamped = Math.min(pos, audioDuration);
     pCurrentTime.textContent = formatTime(clamped);
     if (audioDuration > 0) seekFill.style.width = `${(clamped / audioDuration) * 100}%`;
@@ -432,44 +426,38 @@ function startUILoop() {
 }
 
 // ── Drift Detection Loop ──────────────────────────────────────────────────────
+const DRIFT_CHECK_MS   = 500;
+const RESYNC_AHEAD_MS  = 150;
+const RESYNC_BEHIND_MS = 300;
+
 function startDriftLoop() {
   if (driftInterval) clearInterval(driftInterval);
   driftInterval = setInterval(() => {
-    if (!isPlaying || !audioEl) return;
+    if (!isPlaying || !masterIsPlaying) return;
 
-    const actualPos   = audioEl.currentTime;
+    const actualPos   = getCurrentPosition();
     const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
     driftMs = (actualPos - expectedPos) * 1000;
 
     statDrift.textContent = `${driftMs >= 0 ? '+' : ''}${Math.round(driftMs)}ms`;
-
     const abs = Math.abs(driftMs);
     if      (abs < 50)  setSyncStatus('synced',  'In sync');
     else if (abs < 150) setSyncStatus('syncing', `${Math.round(abs)}ms drift`);
     else                setSyncStatus('drifted', `${Math.round(abs)}ms drift`);
 
-    // Hard resync if:
-    //  - ahead by more than RESYNC_AHEAD_MS (+150ms), OR
-    //  - behind by more than RESYNC_BEHIND_MS (-300ms)
-    // AND the cooldown has elapsed (prevents thrash)
-    // AND we've seen N consecutive out-of-range readings (prevents single noisy
-    //   clock sample from triggering a glitch)
-    const needsResync = (driftMs > RESYNC_AHEAD_MS) || (driftMs < -RESYNC_BEHIND_MS);
-    const cooldownOk  = (Date.now() - lastResyncAt) >= RESYNC_COOLDOWN_MS;
-
-    if (needsResync) {
+    // FIX 2: require 2 consecutive out-of-range readings before auto-resync
+    if (driftMs > RESYNC_AHEAD_MS || driftMs < -RESYNC_BEHIND_MS) {
       driftOutOfRangeCount++;
+      if (driftOutOfRangeCount >= DRIFT_CONFIRM_COUNT) {
+        driftOutOfRangeCount = 0;
+        resyncs++;
+        statResyncs.textContent = String(resyncs);
+        const targetRaw = getEstimatedMasterPosition();
+        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      }
     } else {
-      driftOutOfRangeCount = 0;  // reset on any in-range reading
-    }
-
-    if (needsResync && cooldownOk && masterIsPlaying && driftOutOfRangeCount >= RESYNC_CONFIRM_CHECKS) {
       driftOutOfRangeCount = 0;
-      resyncs++;
-      statResyncs.textContent = String(resyncs);
-      setSyncStatus('syncing', 'Auto-resyncing…');
-      const targetRaw = getEstimatedMasterPosition();
-      startPlayback(targetRaw - (manualOffsetMs / 1000));
     }
   }, DRIFT_CHECK_MS);
 }
@@ -484,22 +472,10 @@ function setupMediaSession(title: string) {
       { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
     ],
   });
-  // Disable lock screen transport controls — the master controls playback.
-  // If we leave these enabled, iOS/Android will show play/pause/seek buttons
-  // that would let the audience control their own audio independently.
-  navigator.mediaSession.setActionHandler('play',         null);
-  navigator.mediaSession.setActionHandler('pause',        null);
-  navigator.mediaSession.setActionHandler('seekto',       null);
-  navigator.mediaSession.setActionHandler('seekforward',  null);
-  navigator.mediaSession.setActionHandler('seekbackward', null);
 }
 
 function updateMediaSession() {
   if (!('mediaSession' in navigator)) return;
-  // Only set playbackState — do NOT call setPositionState().
-  // setPositionState() triggers OS media events on iOS/Android that cause
-  // audible interruptions when called frequently. The OS reads currentTime
-  // directly from the HTMLAudioElement.
   navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
 }
 
@@ -510,97 +486,89 @@ function updatePlayPauseBtn() {
 }
 
 playPauseBtn.addEventListener('click', async () => {
-  if (!audioEl || audioDuration === 0) return;
+  if (!audioBuffer) return;
 
   if (isPlaying) {
     stopPlayback();
+    pendingPlaybackPos = null;
     setSyncStatus('synced', 'Paused locally');
   } else {
-    // Jump to where the master is right now
-    const rawPos = getEstimatedMasterPosition();
-    await startPlayback(rawPos - (manualOffsetMs / 1000));
-    setSyncStatus('synced', 'In sync');
+    ensureAudioContext();
+    await resumeAudioContext();
+
+    if (audioCtx!.state !== 'running') {
+      const rawPos = getEstimatedMasterPosition();
+      pendingPlaybackPos = rawPos - (manualOffsetMs / 1000);
+      setSyncStatus('syncing', 'Waiting for audio…');
+    } else {
+      const rawPos = getEstimatedMasterPosition();
+      startPlayback(rawPos - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'In sync');
+    }
   }
 });
 
 // ── Show Command Handler ──────────────────────────────────────────────────────
-/**
- * Handle a command from the master player.
- *
- * Master sends:
- *  - 'play'  — when play is pressed, or when seeking while playing
- *  - 'pause' — when pause is pressed
- *  - 'seek'  — when seeking while paused
- *  - 'load'  — when a new audio file is loaded
- *
- * cmd.position is already transit-corrected by the Service Worker.
- * cmd.receivedAt is the client wall-clock ms when the SW received the message.
- */
 async function handleShowCommand(cmd: ShowCommand) {
-  if (!audioEl || audioDuration === 0) {
-    // Audio not loaded yet — queue the command
+  if (!audioBuffer) {
     pendingCommand = cmd;
     return;
   }
 
-  // Update master state.
-  // IMPORTANT: masterPositionAt MUST use Date.now() on the main thread.
-  // cmd.receivedAt is from the SW thread clock, which can skew relative to
-  // the main thread clock on iOS (especially with screen lock throttling).
-  // Using two different clocks in the drift calculation causes false drift readings.
-  //
-  // Transit correction is already baked into cmd.position by the SW's
-  // broadcastCommand() function for 'play' actions.
-  const now = Date.now();
-  if (cmd.action === 'play') {
-    masterIsPlaying  = true;
-    masterPosition   = cmd.position;
-    masterPositionAt = now;
-  } else if (cmd.action === 'pause') {
-    masterIsPlaying  = false;
-    masterPosition   = cmd.position;
-    masterPositionAt = now;
-  } else if (cmd.action === 'seek') {
-    masterIsPlaying  = false;  // seek is only sent when paused
-    masterPosition   = cmd.position;
-    masterPositionAt = now;
-  }
-  // 'load' doesn't update position tracking
-
-  setSyncStatus('syncing', 'Syncing…');
+  // FIX 1: always use Date.now() on the main thread for masterPositionAt.
+  // Do NOT use cmd.receivedAt (SW thread clock) — it can skew relative to
+  // the main thread clock, especially on iOS with screen lock throttling.
+  masterPosition   = cmd.position;
+  masterPositionAt = Date.now(); // FIX 1
 
   switch (cmd.action) {
     case 'play': {
-      // Master is playing — start from the transit-corrected position
-      await startPlayback(cmd.position - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'In sync');
+      masterIsPlaying = true;
+      ensureAudioContext();
+      await resumeAudioContext();
+      pendingPlaybackPos = null;
+      if (audioCtx!.state !== 'running') {
+        pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
+        setSyncStatus('syncing', 'Waiting for audio…');
+      } else {
+        startPlayback(cmd.position - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      }
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
       break;
     }
-
     case 'pause': {
+      masterIsPlaying = false;
       stopPlayback();
-      // Seek to exact pause position so next play starts from the right spot
-      if (audioEl) {
-        audioEl.currentTime = Math.max(0, Math.min(cmd.position, audioDuration));
-      }
+      playStartPos = cmd.position;
       setSyncStatus('synced', 'Paused');
       break;
     }
-
     case 'seek': {
-      // Master seeked while paused — move to new position, stay paused
+      const wasPlaying = isPlaying;
       stopPlayback();
-      if (audioEl) {
-        audioEl.currentTime = Math.max(0, Math.min(cmd.position, audioDuration));
+      pendingPlaybackPos = null;
+      playStartPos = cmd.position;
+      if (wasPlaying || masterIsPlaying) {
+        masterIsPlaying = true;
+        ensureAudioContext();
+        await resumeAudioContext();
+        if (audioCtx!.state !== 'running') {
+          pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
+          setSyncStatus('syncing', 'Waiting for audio…');
+        } else {
+          startPlayback(cmd.position - (manualOffsetMs / 1000));
+          setSyncStatus('synced', 'In sync');
+        }
+      } else {
+        setSyncStatus('synced', 'Paused');
       }
-      setSyncStatus('synced', 'Paused');
       break;
     }
-
     case 'load': {
+      masterIsPlaying = false;
       stopPlayback();
-      if (audioEl) audioEl.currentTime = 0;
+      playStartPos = 0;
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
       waitingOverlay.classList.remove('hidden');
       setSyncStatus('waiting', 'Waiting for master');
@@ -611,22 +579,31 @@ async function handleShowCommand(cmd: ShowCommand) {
 
 // ── Manual Resync ─────────────────────────────────────────────────────────────
 async function doManualResync() {
-  if (!audioEl || audioDuration === 0) return;
+  if (!audioBuffer) return;
+  ensureAudioContext();
+  await resumeAudioContext();
+
   const masterPos = getEstimatedMasterPosition();
+
   if (masterIsPlaying) {
-    await startPlayback(masterPos - (manualOffsetMs / 1000));
-    setSyncStatus('synced', 'Resynced');
-  } else {
-    // Master is paused — seek to its position and stay paused
-    stopPlayback();
-    if (audioEl) {
-      audioEl.currentTime = Math.max(0, Math.min(masterPos, audioDuration));
+    pendingPlaybackPos = null;
+    if (audioCtx!.state !== 'running') {
+      pendingPlaybackPos = masterPos - (manualOffsetMs / 1000);
+      setSyncStatus('syncing', 'Waiting for audio…');
+    } else {
+      startPlayback(masterPos - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'Resynced');
     }
+  } else {
+    stopPlayback();
+    pendingPlaybackPos = null;
+    playStartPos = masterPos;
     setSyncStatus('synced', 'Paused');
   }
 }
 
 resyncBtn.addEventListener('click', () => {
+  sendToSW({ type: 'sw_hard_resync' });
   doManualResync().then(() => {
     resyncBtn.textContent = '✓ Synced!';
     setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
@@ -634,14 +611,11 @@ resyncBtn.addEventListener('click', () => {
 });
 
 // ── Fine-Tune Offset Controls ─────────────────────────────────────────────────
-/**
- * Apply a new manual offset immediately.
- * The old offset was baked into audioEl.currentTime — strip it to get the
- * raw position, then re-apply the new offset via startPlayback().
- */
 function applyOffsetChange(oldOffsetMs: number) {
-  if (!audioEl || !isPlaying) return;
-  const rawPos = audioEl.currentTime - (oldOffsetMs / 1000);
+  if (!audioBuffer || !isPlaying) return;
+  // getCurrentPosition() returns position WITH old offset baked in.
+  // Strip old offset to get raw position; startPlayback re-adds new offset.
+  const rawPos = getCurrentPosition() - (oldOffsetMs / 1000);
   startPlayback(rawPos);
 }
 
@@ -664,37 +638,6 @@ ftReset.addEventListener('click', () => {
   manualOffsetMs = 0;
   saveManualOffset();
   applyOffsetChange(old);
-});
-
-// ── Visibility Change — Screen Wake Recovery ──────────────────────────────────
-document.addEventListener('visibilitychange', async () => {
-  if (document.hidden) return;
-
-  // Screen came back on — request a fresh clock sync burst from the SW
-  sendToSW({ type: 'sw_hard_resync' });
-
-  if (!audioEl || audioDuration === 0) return;
-
-  if (masterIsPlaying) {
-    if (!isPlaying) {
-      // Should be playing but isn't (OS interrupted while screen was off)
-      setSyncStatus('drifted', 'Resyncing after screen lock…');
-      const targetRaw = getEstimatedMasterPosition();
-      await startPlayback(targetRaw - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'In sync');
-    } else {
-      // Is playing — check if we've drifted significantly
-      const actualPos   = audioEl.currentTime;
-      const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
-      const drift       = (actualPos - expectedPos) * 1000;
-      if (drift > RESYNC_AHEAD_MS || drift < -RESYNC_BEHIND_MS) {
-        setSyncStatus('drifted', 'Resyncing after screen lock…');
-        const targetRaw = getEstimatedMasterPosition();
-        await startPlayback(targetRaw - (manualOffsetMs / 1000));
-        setSyncStatus('synced', 'In sync');
-      }
-    }
-  }
 });
 
 // ── Service Worker Message Handler ───────────────────────────────────────────
@@ -748,10 +691,7 @@ function handleSWMessage(event: MessageEvent) {
 
 async function handleAudioReady(filename: string, hash: string) {
   const existing = await loadAudio(showId);
-  if (existing?.hash === hash) {
-    // Already have the right audio — no need to re-download
-    return;
-  }
+  if (existing?.hash === hash) return;
   setSyncStatus('syncing', 'Downloading audio…');
   trackName.textContent = 'Downloading audio…';
   try {
@@ -766,10 +706,53 @@ async function handleAudioReady(filename: string, hash: string) {
   }
 }
 
+// ── Visibility Change — Hard Resync on Screen Wake ────────────────────────────
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden) return;
+
+  // Tab came back to foreground.
+  // ensureAudioContext() recreates a closed context (Android screen-off + film end).
+  // resumeAudioContext() handles suspended/interrupted states (iOS screen-lock).
+  if (audioCtx) {
+    ensureAudioContext();
+    await resumeAudioContext();
+  }
+
+  // Request immediate ping burst from Service Worker to refresh clock offset
+  sendToSW({ type: 'sw_hard_resync' });
+
+  // If AudioContext is still not running, statechange handler will restart playback
+  if (audioCtx?.state !== 'running') return;
+
+  // Context is running — restart silent keepalive
+  startSilentKeepalive();
+
+  if (masterIsPlaying && audioBuffer) {
+    if (!isPlaying) {
+      // Should be playing but aren't (audio stopped while screen was off)
+      setSyncStatus('drifted', 'Resyncing after background…');
+      const targetRaw = getEstimatedMasterPosition();
+      startPlayback(targetRaw - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'In sync');
+    } else {
+      // Playing — check drift
+      const actualPos   = getCurrentPosition();
+      const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
+      const drift       = (actualPos - expectedPos) * 1000;
+      if (Math.abs(drift) > 200) {
+        setSyncStatus('drifted', 'Resyncing after background…');
+        const targetRaw = getEstimatedMasterPosition();
+        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      }
+    }
+  }
+});
+
 // ── Service Worker Setup ──────────────────────────────────────────────────────
 async function registerSyncWorker(wsUrl: string): Promise<void> {
   if (!('serviceWorker' in navigator)) {
-    console.warn('[SW] Not supported — using direct WebSocket');
+    console.warn('SW not supported — using direct WebSocket');
     startDirectWebSocket(wsUrl);
     return;
   }
@@ -794,7 +777,7 @@ async function registerSyncWorker(wsUrl: string): Promise<void> {
       if (useSW && sw) {
         initSW(sw);
       } else {
-        console.warn('[SW] Timed out — using direct WebSocket');
+        console.warn('[SW] Timed out waiting for controller — using direct WebSocket');
         startDirectWebSocket(wsUrl);
       }
       resolve();
@@ -812,13 +795,13 @@ async function registerSyncWorker(wsUrl: string): Promise<void> {
         clearTimeout(timeout);
         done(true, navigator.serviceWorker.controller);
       } else if (reg.active) {
-        // SW active but not claimed yet — controllerchange will fire
+        // SW is active but hasn't claimed yet — controllerchange will fire
       }
     });
   });
 }
 
-// ── Fallback: Direct WebSocket ────────────────────────────────────────────────
+// ── Fallback: Direct WebSocket ─────────────────────────────────────────────────
 function startDirectWebSocket(wsUrl: string) {
   const ws = new WebSocket(wsUrl);
   let clockOffsetDirect = 0;
@@ -860,15 +843,15 @@ function startDirectWebSocket(wsUrl: string) {
 
     if (msg.type === 'welcome' || msg.type === 'sync') {
       const receivedAt = Date.now();
-      const rawPos  = (msg.position as number) || 0;
+      const rawPos = (msg.position as number) || 0;
       const serverTs = (msg.serverTs as number) || receivedAt;
-      const isPlay  = !!(msg.isPlaying || msg.action === 'play');
-      const action  = (msg.action as string) || (isPlay ? 'play' : 'pause');
+      const isPlay = !!(msg.isPlaying || msg.action === 'play');
+      const action = (msg.action as string) || (isPlay ? 'play' : 'pause');
       let correctedPos = rawPos;
       if (action === 'play') {
         const serverNow = receivedAt + clockOffsetDirect;
-        const transit   = Math.max(0, serverNow - serverTs);
-        correctedPos    = rawPos + transit / 1000;
+        const transit = Math.max(0, serverNow - serverTs);
+        correctedPos = rawPos + transit / 1000;
       }
       handleSWMessage({ data: { type: 'sw_command', action, position: correctedPos, serverTs, masterTs: msg.masterTs || 0, audioFile: msg.audioFile || null, receivedAt, clockOffsetMs: clockOffsetDirect } } as MessageEvent);
     }
@@ -902,7 +885,7 @@ async function joinShow() {
   joinBtn.textContent = 'Connecting…';
 
   try {
-    // 1. Fetch current show state from server
+    // 1. Fetch show state
     const stateRes = await fetch(`${serverBaseUrl}/api/show/${showId}/state`);
     if (!stateRes.ok) throw new Error(`Server error: ${stateRes.status}`);
     const state = await stateRes.json() as {
@@ -911,13 +894,12 @@ async function joinShow() {
       audioReady?: boolean;
       isPlaying:   boolean;
       position:    number;
-      serverTs?:   number;
     };
 
     // 2. Check local audio cache
     let audioData = await loadAudio(showId);
     if (audioData && state.audioHash && audioData.hash !== state.audioHash) {
-      audioData = null; // stale — will re-download
+      audioData = null;
     }
 
     // 3. Download audio if needed
@@ -940,35 +922,26 @@ async function joinShow() {
     resyncBtn.disabled    = true;
     trackName.textContent = audioData?.filename || 'Waiting for audio…';
 
-    // 5. Set initial master state from HTTP response.
-    // Correct for transit time if master was playing when we fetched state.
-    const fetchedAt = Date.now();
+    // 5. Set initial master state from HTTP response (FIX 1: main thread clock)
     masterIsPlaying  = state.isPlaying;
-    if (state.isPlaying && state.serverTs) {
-      // Advance position by how long it took to receive the state
-      const transitMs = Math.max(0, fetchedAt - state.serverTs);
-      masterPosition   = state.position + transitMs / 1000;
-    } else {
-      masterPosition = state.position;
-    }
-    masterPositionAt = fetchedAt;
+    masterPosition   = state.position;
+    masterPositionAt = Date.now();
 
     // 6. Connect Service Worker WebSocket
     const wsUrl = serverBaseUrl.replace(/^http/, 'ws') + `/api/show/${showId}/ws`;
     await registerSyncWorker(wsUrl);
     setSyncStatus('syncing', 'Syncing clock…');
 
-    // 7. Init audio (commands queued in pendingCommand while audio loads)
+    // 7. Decode audio
     if (audioData) {
       await initAudio(audioData.data);
-      trackName.textContent = audioData.filename;
-      setupMediaSession(audioData.filename);
+      // Start silent keepalive to keep AudioContext alive on iOS screen lock (FIX 3)
+      startSilentKeepalive();
 
       if (pendingCommand) {
-        // A command arrived while we were loading audio — apply it now,
-        // correcting for the time that passed since it was received.
         const cmd = pendingCommand;
         pendingCommand = null;
+
         if (cmd.action === 'play') {
           const elapsed = (Date.now() - cmd.receivedAt) / 1000;
           cmd.position += elapsed;
@@ -976,17 +949,12 @@ async function joinShow() {
           masterPositionAt = Date.now();
         }
         await handleShowCommand(cmd);
+
       } else if (state.isPlaying) {
-        // No pending command — start from our estimated master position
         const masterPos = getEstimatedMasterPosition();
-        await startPlayback(masterPos - (manualOffsetMs / 1000));
+        await resumeAudioContext();
+        startPlayback(masterPos - (manualOffsetMs / 1000));
         setSyncStatus('synced', 'In sync');
-      } else {
-        // Master is paused — seek to its position and wait
-        if (audioEl) {
-          audioEl.currentTime = Math.max(0, Math.min(masterPosition, audioDuration));
-        }
-        setSyncStatus('synced', 'Paused — waiting for master');
       }
     }
 
@@ -1004,11 +972,16 @@ if (savedShowId    && !joinShowIdInput.value)    joinShowIdInput.value    = save
 if (savedServerUrl && !joinServerUrlInput.value) joinServerUrlInput.value = savedServerUrl;
 
 joinBtn.addEventListener('click', () => {
+  ensureAudioContext();
+  resumeAudioContext();
   joinShow().catch(err => showError(err instanceof Error ? err.message : String(err)));
 });
 
 [joinShowIdInput, joinServerUrlInput].forEach(input => {
   input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') joinBtn.click();
+    if (e.key === 'Enter') {
+      ensureAudioContext();
+      joinShow().catch(err => showError(err instanceof Error ? err.message : String(err)));
+    }
   });
 });
