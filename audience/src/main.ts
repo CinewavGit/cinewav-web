@@ -354,7 +354,6 @@ async function startPlayback(rawPosition: number): Promise<void> {
 function stopPlayback() {
   if (audioEl) {
     audioEl.pause();
-    audioEl.playbackRate = 1.0;  // reset any drift nudge
     playStartPos = audioEl.currentTime;
   }
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
@@ -381,12 +380,10 @@ function startUILoop() {
 }
 
 // ── Drift Detection Loop ──────────────────────────────────────────────────────
-const DRIFT_CHECK_MS      = 500;
-// Hard-seek thresholds — only interrupt playback for large drift.
-// Small drift is corrected silently via playbackRate nudge (no seek interruption).
-const HARD_RESYNC_MS      = 500;   // hard seek if drift exceeds ±500ms
-const RATE_NUDGE_MAX_MS   = 499;   // use playbackRate nudge for drift up to 499ms
-const RATE_NUDGE_FACTOR   = 0.05;  // max ±5% speed adjustment
+const DRIFT_CHECK_MS      = 1000; // check every 1s — less frequent = fewer interruptions
+const HARD_RESYNC_MS      = 500;  // only hard-seek when drift exceeds ±500ms
+let   lastResyncAt        = 0;    // wall-clock ms of last hard resync
+const RESYNC_COOLDOWN_MS  = 5000; // minimum 5s between automatic hard resyncs
 function startDriftLoop() {
   if (driftInterval) clearInterval(driftInterval);
   driftInterval = setInterval(() => {
@@ -399,23 +396,17 @@ function startDriftLoop() {
     if      (abs < 50)  setSyncStatus('synced',  'In sync');
     else if (abs < 150) setSyncStatus('syncing', `${Math.round(abs)}ms drift`);
     else                setSyncStatus('drifted', `${Math.round(abs)}ms drift`);
-    if (abs >= HARD_RESYNC_MS) {
-      // Large drift: hard seek (interrupts playback but necessary)
+    // Only hard-seek for large drift AND only if cooldown has elapsed.
+    // playbackRate nudging is NOT used — it causes iOS to re-buffer on every
+    // rate change, producing audible glitches worse than the drift itself.
+    const now = Date.now();
+    if (abs >= HARD_RESYNC_MS && (now - lastResyncAt) >= RESYNC_COOLDOWN_MS) {
+      lastResyncAt = now;
       resyncs++;
       statResyncs.textContent = String(resyncs);
       const targetRaw = getEstimatedMasterPosition();
-      audioEl.playbackRate = 1.0;
       startPlayback(targetRaw - (manualOffsetMs / 1000));
       setSyncStatus('synced', 'In sync');
-    } else if (abs > 30) {
-      // Small/medium drift: nudge playbackRate to converge without seeking.
-      // driftMs > 0 means we are AHEAD of master → slow down (rate < 1)
-      // driftMs < 0 means we are BEHIND master → speed up (rate > 1)
-      const nudge = Math.min(RATE_NUDGE_FACTOR, abs / 1000);
-      audioEl.playbackRate = driftMs > 0 ? 1.0 - nudge : 1.0 + nudge;
-    } else {
-      // Within 30ms — restore normal rate
-      audioEl.playbackRate = 1.0;
     }
   }, DRIFT_CHECK_MS);
 }
