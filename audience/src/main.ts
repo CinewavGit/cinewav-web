@@ -108,6 +108,10 @@ let pendingCommand: ShowCommand | null = null;
 // Stores the raw position (without manualOffset) to start from once AudioContext is running
 let pendingPlaybackPos: number | null = null;
 
+// Raw audio ArrayBuffer kept in memory so we can re-decode if the AudioContext is closed
+// and needs to be recreated (Android Chrome closes the context when screen-off + film ends)
+let rawAudioData: ArrayBuffer | null = null;
+
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
@@ -210,40 +214,73 @@ async function downloadAudioFile(url: string, filename: string): Promise<ArrayBu
 }
 
 // ── Audio Engine ──────────────────────────────────────────────────────────────
-function ensureAudioContext() {
-  if (!audioCtx) {
-    audioCtx = new AudioContext();
-    // Listen for AudioContext state changes (suspended <-> running <-> interrupted).
-    // On iOS, locking the screen fires 'interrupted'; unlocking fires 'running'.
-    // On Android, backgrounding can suspend the context.
-    // In both cases we auto-resume and restart playback if we were playing.
-    audioCtx.addEventListener('statechange', () => {
-      if (!audioCtx) return;
-      if (audioCtx.state === 'running') {
-        // Context just became active — restart any deferred playback
-        if (pendingPlaybackPos !== null) {
-          const pos = pendingPlaybackPos;
-          pendingPlaybackPos = null;
-          startPlayback(pos);
-          setSyncStatus('synced', 'In sync');
-        } else if (isPlaying) {
-          // We were playing but context was interrupted — resync to master
-          const targetRaw = getEstimatedMasterPosition();
-          startPlayback(targetRaw - (manualOffsetMs / 1000));
-          setSyncStatus('synced', 'In sync');
-        }
+
+/**
+ * Attach the statechange listener to an AudioContext.
+ * Extracted so it can be re-attached when the context is recreated.
+ */
+function attachAudioContextListeners(ctx: AudioContext) {
+  ctx.addEventListener('statechange', () => {
+    // If this event is from a stale (replaced) context, ignore it
+    if (ctx !== audioCtx) return;
+    if (ctx.state === 'running') {
+      // Context just became active — restart any deferred playback
+      if (pendingPlaybackPos !== null) {
+        const pos = pendingPlaybackPos;
+        pendingPlaybackPos = null;
+        startPlayback(pos);
+        setSyncStatus('synced', 'In sync');
+      } else if (isPlaying) {
+        // We were playing but context was interrupted — resync to master
+        const targetRaw = getEstimatedMasterPosition();
+        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
       }
-    });
+    }
+  });
+}
+
+function ensureAudioContext() {
+  // Create a new context if none exists OR if the existing one is closed.
+  // Android Chrome closes (not just suspends) the AudioContext when the film
+  // ends while the screen is off. A closed context cannot be resumed — it must
+  // be replaced with a fresh one.
+  if (!audioCtx || audioCtx.state === 'closed') {
+    // Stop any lingering source node on the old (closed) context
+    if (sourceNode) {
+      try { sourceNode.stop(); } catch { /* already stopped */ }
+      sourceNode = null;
+    }
+    isPlaying = false;
+    audioCtx = new AudioContext();
+    attachAudioContextListeners(audioCtx);
   }
 }
 
 /**
  * Resume AudioContext regardless of whether it is 'suspended' or 'interrupted'.
  * On iOS, the state after screen-lock is 'interrupted', not 'suspended'.
- * Both states require a resume() call to return to 'running'.
+ * On Android, the context may be 'closed' after the film ends with screen off —
+ * in that case we recreate it and re-decode the audio buffer.
+ * All states require different handling to return to 'running'.
  */
 async function resumeAudioContext(): Promise<void> {
   if (!audioCtx) return;
+
+  if (audioCtx.state === 'closed') {
+    // Closed context — must recreate. ensureAudioContext() handles this.
+    ensureAudioContext();
+    // Re-decode audio buffer for the new context if we have the raw data
+    if (rawAudioData && audioCtx) {
+      try {
+        audioBuffer = await audioCtx.decodeAudioData(rawAudioData.slice(0));
+        audioDuration = audioBuffer.duration;
+      } catch { /* decode failed — buffer stays null */ }
+    }
+    // New context starts in 'running' state — no need to resume
+    return;
+  }
+
   if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
     try { await audioCtx.resume(); } catch { /* ignore */ }
   }
@@ -252,6 +289,9 @@ async function resumeAudioContext(): Promise<void> {
 async function initAudio(arrayBuffer: ArrayBuffer) {
   ensureAudioContext();
   await resumeAudioContext();
+  // Keep a copy of the raw bytes so we can re-decode if the AudioContext is
+  // recreated later (e.g. Android closes it when screen-off + film ends).
+  rawAudioData  = arrayBuffer.slice(0);
   audioBuffer   = await audioCtx!.decodeAudioData(arrayBuffer.slice(0));
   audioDuration = audioBuffer.duration;
   pTotalTime.textContent = formatTime(audioDuration);
@@ -478,7 +518,10 @@ playPauseBtn.addEventListener('click', async () => {
 
 // ── Show Command Handler ──────────────────────────────────────────────────────
 async function handleShowCommand(cmd: ShowCommand) {
-  if (!audioCtx || !audioBuffer) {
+  // A closed AudioContext is non-null but dead — don't treat it as missing.
+  // The play/seek cases call ensureAudioContext() which will recreate it.
+  // Only bail out if audioBuffer is missing (audio not yet loaded).
+  if (!audioBuffer) {
     pendingCommand = cmd;
     return;
   }
@@ -497,6 +540,7 @@ async function handleShowCommand(cmd: ShowCommand) {
 
   switch (cmd.action) {
     case 'play': {
+      ensureAudioContext(); // recreates if closed (Android screen-off + film end)
       await resumeAudioContext();
       pendingPlaybackPos = null;
       if (audioCtx.state !== 'running') {
@@ -527,6 +571,7 @@ async function handleShowCommand(cmd: ShowCommand) {
       masterPosition   = cmd.position;
       masterPositionAt = Date.now();
       if (wasPlaying) {
+        ensureAudioContext(); // recreates if closed
         await resumeAudioContext();
         if (audioCtx.state !== 'running') {
           pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
@@ -681,13 +726,17 @@ async function handleAudioReady(filename: string, hash: string) {
   }
 }
 
-// ── Visibility Change — Hard Resync ──────────────────────────────────────────
+// ── Visibility Change — Hard Resync ────────────────────────────────────────────
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) return;
 
-  // Tab just came back to foreground — resume AudioContext regardless of state
-  // (iOS uses 'interrupted', Android uses 'suspended')
-  if (audioCtx) await resumeAudioContext();
+  // Tab just came back to foreground.
+  // ensureAudioContext() recreates a closed context (Android screen-off + film end).
+  // resumeAudioContext() handles suspended/interrupted states (iOS screen-lock).
+  if (audioCtx) {
+    ensureAudioContext(); // recreates if closed
+    await resumeAudioContext();
+  }
 
   // Request immediate ping burst from Service Worker to refresh clock offset
   sendToSW({ type: 'sw_hard_resync' });
