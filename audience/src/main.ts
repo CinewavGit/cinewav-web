@@ -262,9 +262,11 @@ async function initAudio(arrayBuffer: ArrayBuffer): Promise<void> {
     // visibilitychange handler knows to restart on wake.
     audioEl.addEventListener('pause', () => {
       // Ignore pauses that WE initiated:
-      //  - stopPlayback() sets isPlaying=false before pause() — isPlaying is already false here
-      //  - startPlayback() sets isSeekingInternal=true before pause() — skip this event
-      // Only act on external OS pauses (phone call, screen lock, Bluetooth disconnect).
+      //  - stopPlayback() sets isPlaying=false BEFORE calling audioEl.pause(), so
+      //    isPlaying is already false here — the if(isPlaying) check below is a no-op.
+      //  - startPlayback() sets isSeekingInternal=true before its internal pause().
+      // Only act on external OS pauses (phone call, screen lock, Bluetooth disconnect)
+      // where isPlaying is still true and isSeekingInternal is false.
       if (isSeekingInternal) return;
       if (isPlaying) {
         isPlaying = false;
@@ -367,6 +369,12 @@ async function startPlayback(rawPosition: number): Promise<void> {
     return;
   }
   isSeekingInternal = false;
+  // Reset the drift-loop resync cooldown clock so it starts from NOW.
+  // Without this, if the drift loop triggered this startPlayback() call,
+  // lastResyncAt is already 5s old and the loop could fire again immediately.
+  // Also prevents the iOS 5-second glitch: after startPlayback() completes,
+  // the drift loop sees a fresh cooldown and won't hard-seek again for 5s.
+  lastResyncAt = Date.now();
   // Do NOT reset masterPositionAt here. masterPosition + (Date.now() - masterPositionAt)
   // is already a running estimate of where the master is. Resetting masterPositionAt
   // to Date.now() would anchor the clock to masterPosition (the stale command position),
@@ -382,13 +390,18 @@ async function startPlayback(rawPosition: number): Promise<void> {
 }
 
 function stopPlayback() {
-  if (audioEl) {
-    audioEl.pause();
-    playStartPos = audioEl.currentTime;
-  }
+  // Set isPlaying=false BEFORE calling audioEl.pause().
+  // The 'pause' event listener checks isPlaying to detect external OS pauses.
+  // If we set it after, the listener sees isPlaying=true and treats our own
+  // stopPlayback() call as an external interruption, clearing loops at the
+  // wrong time (e.g. after a subsequent startPlayback() has already started).
+  isPlaying = false;
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
-  isPlaying = false;
+  if (audioEl) {
+    playStartPos = audioEl.currentTime;
+    audioEl.pause();
+  }
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
 }
