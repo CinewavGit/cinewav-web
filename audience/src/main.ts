@@ -117,6 +117,31 @@ const DRIFT_CONFIRM_COUNT = 2;
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
+// ── Serial Command Queue ──────────────────────────────────────────────────────
+// handleShowCommand is async. If two commands arrive in rapid succession (e.g.
+// seek + play from the master), they must be processed strictly one at a time.
+// Without this, concurrent executions corrupt shared state (sourceNode,
+// isPlaying, masterPositionAt, driftInterval).
+let commandQueue: ShowCommand[] = [];
+let commandQueueRunning = false;
+
+function enqueueCommand(cmd: ShowCommand) {
+  // Drop all queued commands except the latest — only the most recent
+  // state matters. Keep any currently-executing command running.
+  commandQueue = [cmd];
+  if (!commandQueueRunning) drainCommandQueue();
+}
+
+function drainCommandQueue() {
+  if (commandQueue.length === 0) {
+    commandQueueRunning = false;
+    return;
+  }
+  commandQueueRunning = true;
+  const cmd = commandQueue.shift()!;
+  handleShowCommand(cmd).then(() => drainCommandQueue()).catch(() => drainCommandQueue());
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatTime(s: number): string {
   if (!isFinite(s) || s < 0) return '0:00';
@@ -676,7 +701,7 @@ function handleSWMessage(event: MessageEvent) {
         receivedAt:    msg.receivedAt,
         clockOffsetMs: msg.clockOffsetMs,
       };
-      handleShowCommand(cmd);
+      enqueueCommand(cmd);
       break;
     }
 
