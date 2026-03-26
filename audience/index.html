@@ -661,8 +661,10 @@
     <button class="btn btn-primary" onclick="location.reload()" style="max-width:200px;margin-top:8px;">Try Again</button>
   </div>
 
-  <!-- Silent audio loop to keep AudioContext alive when screen is off -->
-  <audio id="silent-audio" loop preload="auto">
+  <!-- Silent audio loop keeps the iOS/Android audio session alive when screen is off.
+       playsinline prevents iOS from going fullscreen; x-webkit-airplay disables AirPlay
+       hijacking. The loop attribute ensures it never stops. -->
+  <audio id="silent-audio" loop preload="auto" playsinline x-webkit-airplay="deny">
     <source src="/silent.mp3" type="audio/mpeg" />
   </audio>
 

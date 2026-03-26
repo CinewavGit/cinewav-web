@@ -104,6 +104,10 @@ let masterPositionAt = 0;   // Date.now() when masterPosition was last updated
 // Pending command received before audio was decoded
 let pendingCommand: ShowCommand | null = null;
 
+// Pending playback start deferred until AudioContext resumes from suspension/interruption
+// Stores the raw position (without manualOffset) to start from once AudioContext is running
+let pendingPlaybackPos: number | null = null;
+
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
@@ -207,12 +211,47 @@ async function downloadAudioFile(url: string, filename: string): Promise<ArrayBu
 
 // ── Audio Engine ──────────────────────────────────────────────────────────────
 function ensureAudioContext() {
-  if (!audioCtx) audioCtx = new AudioContext();
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    // Listen for AudioContext state changes (suspended <-> running <-> interrupted).
+    // On iOS, locking the screen fires 'interrupted'; unlocking fires 'running'.
+    // On Android, backgrounding can suspend the context.
+    // In both cases we auto-resume and restart playback if we were playing.
+    audioCtx.addEventListener('statechange', () => {
+      if (!audioCtx) return;
+      if (audioCtx.state === 'running') {
+        // Context just became active — restart any deferred playback
+        if (pendingPlaybackPos !== null) {
+          const pos = pendingPlaybackPos;
+          pendingPlaybackPos = null;
+          startPlayback(pos);
+          setSyncStatus('synced', 'In sync');
+        } else if (isPlaying) {
+          // We were playing but context was interrupted — resync to master
+          const targetRaw = getEstimatedMasterPosition();
+          startPlayback(targetRaw - (manualOffsetMs / 1000));
+          setSyncStatus('synced', 'In sync');
+        }
+      }
+    });
+  }
+}
+
+/**
+ * Resume AudioContext regardless of whether it is 'suspended' or 'interrupted'.
+ * On iOS, the state after screen-lock is 'interrupted', not 'suspended'.
+ * Both states require a resume() call to return to 'running'.
+ */
+async function resumeAudioContext(): Promise<void> {
+  if (!audioCtx) return;
+  if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
+    try { await audioCtx.resume(); } catch { /* ignore */ }
+  }
 }
 
 async function initAudio(arrayBuffer: ArrayBuffer) {
   ensureAudioContext();
-  if (audioCtx!.state === 'suspended') await audioCtx!.resume();
+  await resumeAudioContext();
   audioBuffer   = await audioCtx!.decodeAudioData(arrayBuffer.slice(0));
   audioDuration = audioBuffer.duration;
   pTotalTime.textContent = formatTime(audioDuration);
@@ -278,7 +317,12 @@ function startPlayback(rawPosition: number) {
       if (uiInterval)   { clearInterval(uiInterval);   uiInterval   = null; }
       if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
       updatePlayPauseBtn();
-      setSyncStatus('synced', 'Show ended');
+      // Only show 'Show ended' if master is also not playing.
+      // If master has already restarted (e.g. seeked back to 0 and pressed play),
+      // we should NOT show 'Show ended' — the next sync command will restart us.
+      if (!masterIsPlaying) {
+        setSyncStatus('synced', 'Show ended');
+      }
     }
   };
 
@@ -386,6 +430,15 @@ function startSilentAudio() {
   silentAudio.loop   = true;
   silentAudio.volume = 0.001;
   silentAudio.play().catch(() => {});
+  // Guard: if the silent audio ever stops (e.g. iOS kills it), restart it.
+  // This is the key mechanism that keeps the audio session alive on iOS
+  // when the screen is locked — without it, iOS suspends the AudioContext.
+  silentAudio.addEventListener('pause', () => {
+    // Only auto-restart if we're still in the player screen and not intentionally stopped
+    if (audioBuffer) {
+      silentAudio.play().catch(() => {});
+    }
+  }, { once: false });
 }
 
 // ── Play/Pause Button ─────────────────────────────────────────────────────────
@@ -399,6 +452,7 @@ playPauseBtn.addEventListener('click', async () => {
 
   if (isPlaying) {
     stopPlayback();
+    pendingPlaybackPos = null;
     setSyncStatus('synced', 'Paused locally');
   } else {
     // Update DOM synchronously BEFORE any await (Android Chrome fix)
@@ -406,11 +460,19 @@ playPauseBtn.addEventListener('click', async () => {
     updatePlayPauseBtn();
 
     ensureAudioContext();
-    if (audioCtx!.state === 'suspended') await audioCtx!.resume();
+    await resumeAudioContext();
 
-    const rawPos = getEstimatedMasterPosition();
-    startPlayback(rawPos - (manualOffsetMs / 1000));
-    setSyncStatus('synced', 'In sync');
+    // If AudioContext is still not running after resume() (e.g. iOS needs
+    // another user interaction), defer playback until statechange fires.
+    if (audioCtx!.state !== 'running') {
+      const rawPos = getEstimatedMasterPosition();
+      pendingPlaybackPos = rawPos - (manualOffsetMs / 1000);
+      setSyncStatus('syncing', 'Waiting for audio…');
+    } else {
+      const rawPos = getEstimatedMasterPosition();
+      startPlayback(rawPos - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'In sync');
+    }
   }
 });
 
@@ -421,8 +483,13 @@ async function handleShowCommand(cmd: ShowCommand) {
     return;
   }
 
-  // Update master state tracking
-  masterIsPlaying  = (cmd.action === 'play');
+  // Update master state tracking.
+  // For 'seek', preserve the current masterIsPlaying value — the master
+  // broadcasts 'seek' only when paused; when playing it sends 'play' directly.
+  // Setting masterIsPlaying=false for 'seek' would break the drift loop.
+  if (cmd.action !== 'seek') {
+    masterIsPlaying = (cmd.action === 'play');
+  }
   masterPosition   = cmd.position;
   masterPositionAt = cmd.receivedAt;
 
@@ -430,9 +497,16 @@ async function handleShowCommand(cmd: ShowCommand) {
 
   switch (cmd.action) {
     case 'play': {
-      if (audioCtx.state === 'suspended') await audioCtx.resume();
-      startPlayback(cmd.position - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'In sync');
+      await resumeAudioContext();
+      pendingPlaybackPos = null;
+      if (audioCtx.state !== 'running') {
+        // AudioContext not yet running (e.g. iOS interrupted) — defer until statechange
+        pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
+        setSyncStatus('syncing', 'Waiting for audio…');
+      } else {
+        startPlayback(cmd.position - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      }
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
       break;
     }
@@ -448,13 +522,19 @@ async function handleShowCommand(cmd: ShowCommand) {
     case 'seek': {
       const wasPlaying = isPlaying;
       stopPlayback();
+      pendingPlaybackPos = null;
       playStartPos = cmd.position;
       masterPosition   = cmd.position;
       masterPositionAt = Date.now();
       if (wasPlaying) {
-        if (audioCtx.state === 'suspended') await audioCtx.resume();
-        startPlayback(cmd.position - (manualOffsetMs / 1000));
-        setSyncStatus('synced', 'In sync');
+        await resumeAudioContext();
+        if (audioCtx.state !== 'running') {
+          pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
+          setSyncStatus('syncing', 'Waiting for audio…');
+        } else {
+          startPlayback(cmd.position - (manualOffsetMs / 1000));
+          setSyncStatus('synced', 'In sync');
+        }
       } else {
         setSyncStatus('synced', 'Paused');
       }
@@ -475,15 +555,23 @@ async function handleShowCommand(cmd: ShowCommand) {
 async function doManualResync() {
   if (!audioBuffer) return;
   ensureAudioContext();
-  if (audioCtx!.state === 'suspended') await audioCtx!.resume();
+  await resumeAudioContext();
 
   const masterPos = getEstimatedMasterPosition();
 
   if (masterIsPlaying) {
-    startPlayback(masterPos - (manualOffsetMs / 1000));
-    setSyncStatus('synced', 'Resynced');
+    pendingPlaybackPos = null;
+    if (audioCtx!.state !== 'running') {
+      // Defer until AudioContext resumes
+      pendingPlaybackPos = masterPos - (manualOffsetMs / 1000);
+      setSyncStatus('syncing', 'Waiting for audio…');
+    } else {
+      startPlayback(masterPos - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'Resynced');
+    }
   } else {
     stopPlayback();
+    pendingPlaybackPos = null;
     playStartPos = masterPos;
     setSyncStatus('synced', 'Paused');
   }
@@ -597,24 +685,37 @@ async function handleAudioReady(filename: string, hash: string) {
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) return;
 
-  // Tab just came back to foreground
-  if (audioCtx?.state === 'suspended') await audioCtx.resume();
+  // Tab just came back to foreground — resume AudioContext regardless of state
+  // (iOS uses 'interrupted', Android uses 'suspended')
+  if (audioCtx) await resumeAudioContext();
 
   // Request immediate ping burst from Service Worker to refresh clock offset
   sendToSW({ type: 'sw_hard_resync' });
 
-  // If we were playing, check drift immediately and resync if needed
-  if (isPlaying && audioBuffer) {
-    const actualPos   = getCurrentPosition();
-    const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
-    const drift       = (actualPos - expectedPos) * 1000;
+  // If AudioContext is still not running, the statechange handler will
+  // restart playback once it becomes 'running'. Nothing more to do here.
+  if (audioCtx?.state !== 'running') return;
 
-    if (Math.abs(drift) > 200) {
-      // Significant drift after background — hard resync immediately
+  // Context is running — check if we need to resync
+  if (masterIsPlaying && audioBuffer) {
+    if (!isPlaying) {
+      // We should be playing but aren't (e.g. audio stopped while screen was off)
       setSyncStatus('drifted', 'Resyncing after background…');
       const targetRaw = getEstimatedMasterPosition();
       startPlayback(targetRaw - (manualOffsetMs / 1000));
       setSyncStatus('synced', 'In sync');
+    } else {
+      // We are playing — check drift
+      const actualPos   = getCurrentPosition();
+      const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
+      const drift       = (actualPos - expectedPos) * 1000;
+
+      if (Math.abs(drift) > 200) {
+        setSyncStatus('drifted', 'Resyncing after background…');
+        const targetRaw = getEstimatedMasterPosition();
+        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      }
     }
   }
 });
@@ -851,7 +952,7 @@ async function joinShow() {
       } else if (state.isPlaying) {
         // Show already playing — use estimated master position
         const masterPos = getEstimatedMasterPosition();
-        if (audioCtx!.state === 'suspended') await audioCtx!.resume();
+        await resumeAudioContext();
         startPlayback(masterPos - (manualOffsetMs / 1000));
         setSyncStatus('synced', 'In sync');
       }
@@ -872,7 +973,7 @@ if (savedServerUrl && !joinServerUrlInput.value) joinServerUrlInput.value = save
 
 joinBtn.addEventListener('click', () => {
   ensureAudioContext();
-  if (audioCtx?.state === 'suspended') audioCtx.resume();
+  resumeAudioContext();
   joinShow().catch(err => showError(err instanceof Error ? err.message : String(err)));
 });
 
