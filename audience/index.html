@@ -6,21 +6,23 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Cinewav" />
-  <meta name="theme-color" content="#0a0a0f" />
+  <meta name="theme-color" content="#0d1117" />
   <title>Cinewav — Audience</title>
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <style>
     :root {
-      --bg: #0a0a0f;
-      --surface: #13131a;
-      --surface2: #1c1c28;
-      --border: #2a2a3d;
-      --accent: #6c63ff;
-      --success: #2ed573;
-      --warning: #ffa502;
-      --danger: #ff4757;
-      --text: #e8e8f0;
-      --text-muted: #7a7a9a;
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1e2530;
+      --border: #263040;
+      --accent: #2a9d8f;
+      --accent-hover: #3ab8a8;
+      --accent-dim: rgba(42, 157, 143, 0.15);
+      --success: #2ec4b6;
+      --warning: #f4a261;
+      --danger: #e63946;
+      --text: #e8edf3;
+      --text-muted: #7a8899;
       --radius: 16px;
     }
 
@@ -62,17 +64,11 @@
       text-align: center;
     }
 
-    .brand-icon {
-      width: 80px;
-      height: 80px;
-      background: linear-gradient(135deg, var(--accent), #a855f7);
-      border-radius: 24px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 40px;
+    .brand-logo {
+      width: 160px;
+      height: auto;
       margin: 0 auto 16px;
-      box-shadow: 0 8px 32px rgba(108, 99, 255, 0.4);
+      display: block;
     }
 
     .brand h1 {
@@ -167,7 +163,7 @@
 
     .progress-bar {
       height: 100%;
-      background: linear-gradient(90deg, var(--accent), #a855f7);
+      background: linear-gradient(90deg, var(--accent), var(--accent-hover));
       border-radius: 8px;
       width: 0%;
       transition: width 0.3s ease;
@@ -256,7 +252,7 @@
       content: '';
       position: absolute;
       inset: 0;
-      background: radial-gradient(circle at 50% 50%, rgba(108,99,255,0.15), transparent 70%);
+      background: radial-gradient(circle at 50% 50%, rgba(42,157,143,0.2), transparent 70%);
       animation: glow 2s ease-in-out infinite alternate;
     }
 
@@ -293,7 +289,7 @@
 
     .seek-fill {
       height: 100%;
-      background: linear-gradient(90deg, var(--accent), #a855f7);
+      background: linear-gradient(90deg, var(--accent), var(--accent-hover));
       border-radius: 2px;
       width: 0%;
       transition: width 0.25s linear;
@@ -414,7 +410,7 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow: 0 4px 20px rgba(108, 99, 255, 0.4);
+      box-shadow: 0 4px 20px rgba(42, 157, 143, 0.4);
       flex-shrink: 0;
     }
     .btn-play-pause:active { transform: scale(0.93); }
@@ -539,8 +535,7 @@
   <!-- ── Join Screen ── -->
   <div class="screen active" id="screen-join">
     <div class="brand">
-      <div class="brand-icon">🎬</div>
-      <h1>Cinewav</h1>
+      <img class="brand-logo" src="/cinewav-logo.png" alt="Cinewav" />
       <p>Synchronized cinema audio</p>
     </div>
     <div class="join-card">
@@ -576,7 +571,7 @@
   <!-- ── Player Screen ── -->
   <div class="screen" id="screen-player">
     <div class="player-header">
-      <div class="logo">🎬 Cinewav</div>
+      <div class="logo"><img src="/cinewav-logo.png" alt="Cinewav" style="height:28px;width:auto;display:block;" /></div>
       <div class="status-pill">
         <div class="status-dot" id="sync-dot"></div>
         <span id="sync-status-text">Waiting</span>
@@ -614,12 +609,12 @@
         <!-- Fine-tune offset -->
         <div class="fine-tune-row">
           <span class="fine-tune-label">Fine Tune</span>
-          <button class="fine-tune-btn" id="ft-minus" aria-label="Shift audio earlier by 50ms">−50ms</button>
+          <button class="fine-tune-btn" id="ft-minus" aria-label="Shift audio earlier by 100ms">−100ms</button>
           <div class="fine-tune-display">
             <span id="ft-value">0</span>
             <span class="ft-unit">ms offset</span>
           </div>
-          <button class="fine-tune-btn" id="ft-plus" aria-label="Shift audio later by 50ms">+50ms</button>
+          <button class="fine-tune-btn" id="ft-plus" aria-label="Shift audio later by 100ms">+100ms</button>
           <button class="btn-reset-offset" id="ft-reset">Reset</button>
         </div>
       </div>

@@ -507,14 +507,14 @@ function applyOffsetChange(oldOffsetMs: number) {
 
 ftMinus.addEventListener('click', () => {
   const old = manualOffsetMs;
-  manualOffsetMs -= 50;
+  manualOffsetMs -= 100;
   saveManualOffset();
   applyOffsetChange(old);
 });
 
 ftPlus.addEventListener('click', () => {
   const old = manualOffsetMs;
-  manualOffsetMs += 50;
+  manualOffsetMs += 100;
   saveManualOffset();
   applyOffsetChange(old);
 });

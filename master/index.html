@@ -7,17 +7,18 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <style>
     :root {
-      --bg: #0a0a0f;
-      --surface: #13131a;
-      --surface2: #1c1c28;
-      --border: #2a2a3d;
-      --accent: #6c63ff;
-      --accent-hover: #8b85ff;
-      --danger: #ff4757;
-      --success: #2ed573;
-      --warning: #ffa502;
-      --text: #e8e8f0;
-      --text-muted: #7a7a9a;
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1e2530;
+      --border: #263040;
+      --accent: #2a9d8f;
+      --accent-hover: #3ab8a8;
+      --accent-dim: rgba(42, 157, 143, 0.15);
+      --danger: #e63946;
+      --success: #2ec4b6;
+      --warning: #f4a261;
+      --text: #e8edf3;
+      --text-muted: #7a8899;
       --radius: 12px;
     }
 
@@ -35,7 +36,7 @@
     header {
       background: var(--surface);
       border-bottom: 1px solid var(--border);
-      padding: 16px 24px;
+      padding: 12px 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -50,30 +51,23 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
     }
 
-    .logo-icon {
-      width: 32px;
-      height: 32px;
-      background: var(--accent);
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 16px;
+    .logo img {
+      height: 36px;
+      width: auto;
+      display: block;
     }
 
     .badge {
       background: var(--accent);
       color: white;
-      font-size: 11px;
-      font-weight: 600;
+      font-size: 10px;
+      font-weight: 700;
       padding: 2px 8px;
       border-radius: 20px;
-      letter-spacing: 0.5px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
     }
 
     .status-bar {
@@ -106,7 +100,7 @@
       display: flex;
       flex: 1;
       overflow: hidden;
-      height: calc(100vh - 65px);
+      height: calc(100vh - 61px);
     }
 
     /* ── Video Panel (left / main) ── */
@@ -140,6 +134,7 @@
     .video-drop-zone.drag-over {
       border-color: var(--accent);
       color: var(--accent);
+      background: var(--accent-dim);
     }
 
     .video-drop-zone .drop-icon {
@@ -199,13 +194,13 @@
 
     .video-overlay .play-btn.play {
       background: var(--success);
-      color: #0a0a0f;
-      box-shadow: 0 0 16px rgba(46, 213, 115, 0.4);
+      color: #0d1117;
+      box-shadow: 0 0 16px rgba(46, 196, 182, 0.4);
     }
     .video-overlay .play-btn.pause {
       background: var(--warning);
-      color: #0a0a0f;
-      box-shadow: 0 0 16px rgba(255, 165, 2, 0.4);
+      color: #0d1117;
+      box-shadow: 0 0 16px rgba(244, 162, 97, 0.4);
     }
     .video-overlay .play-btn:hover { transform: scale(1.08); }
     .video-overlay .play-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
@@ -235,7 +230,7 @@
       border-radius: 50%;
       background: var(--accent);
       cursor: pointer;
-      box-shadow: 0 0 6px rgba(108, 99, 255, 0.6);
+      box-shadow: 0 0 6px rgba(42, 157, 143, 0.6);
     }
 
     .time-display {
@@ -258,7 +253,7 @@
     .fullscreen-btn:hover { background: rgba(255,255,255,0.2); }
 
     .resync-overlay-btn {
-      background: rgba(108, 99, 255, 0.3);
+      background: rgba(42, 157, 143, 0.25);
       border: 1px solid var(--accent);
       color: white;
       padding: 8px 12px;
@@ -268,7 +263,7 @@
       white-space: nowrap;
       transition: background 0.2s;
     }
-    .resync-overlay-btn:hover { background: rgba(108, 99, 255, 0.5); }
+    .resync-overlay-btn:hover { background: rgba(42, 157, 143, 0.45); }
 
     /* ── Control Panel (right sidebar) ── */
     .control-panel {
@@ -292,10 +287,10 @@
 
     .card-title {
       font-size: 11px;
-      font-weight: 600;
+      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 1px;
-      color: var(--text-muted);
+      letter-spacing: 1.2px;
+      color: var(--accent);
       margin-bottom: 12px;
     }
 
@@ -420,7 +415,7 @@
     /* File drop highlight on video panel */
     .video-panel.drag-active .video-drop-zone {
       border-color: var(--accent);
-      background: rgba(108, 99, 255, 0.05);
+      background: var(--accent-dim);
     }
 
     /* Video file info bar */
@@ -429,7 +424,7 @@
       align-items: center;
       gap: 8px;
       padding: 8px 16px;
-      background: rgba(108, 99, 255, 0.1);
+      background: rgba(42, 157, 143, 0.08);
       border-bottom: 1px solid var(--border);
       font-size: 12px;
       color: var(--text-muted);
@@ -474,7 +469,7 @@
     .audio-drop-zone:hover,
     .audio-drop-zone.drag-over {
       border-color: var(--accent);
-      background: rgba(108, 99, 255, 0.05);
+      background: var(--accent-dim);
       color: var(--accent);
     }
 
@@ -500,7 +495,7 @@
 
     .upload-bar-fill {
       height: 100%;
-      background: var(--accent);
+      background: linear-gradient(90deg, var(--accent), var(--accent-hover));
       border-radius: 3px;
       width: 0%;
       transition: width 0.2s;
@@ -519,8 +514,8 @@
       align-items: center;
       gap: 6px;
       padding: 8px 10px;
-      background: rgba(46, 213, 115, 0.1);
-      border: 1px solid rgba(46, 213, 115, 0.3);
+      background: rgba(42, 157, 143, 0.1);
+      border: 1px solid rgba(42, 157, 143, 0.35);
       border-radius: 6px;
       font-size: 12px;
       color: var(--success);
@@ -594,8 +589,7 @@
 <body>
   <header>
     <div class="logo">
-      <div class="logo-icon">🎬</div>
-      Cinewav
+      <img src="/cinewav-logo.png" alt="Cinewav" />
       <span class="badge">MASTER</span>
     </div>
     <div class="status-bar">
