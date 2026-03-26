@@ -115,6 +115,12 @@ let rawAudioData: ArrayBuffer | null = null;
 let driftOutOfRangeCount = 0;
 const DRIFT_CONFIRM_COUNT = 2;
 
+// Guard: true while startPlayback() is in the middle of its async
+// close+create+decode+resume sequence. Prevents the drift loop and health-check
+// timer from firing a second concurrent startPlayback() during that window,
+// which would create duplicate drift intervals and corrupt playStartCtxTime.
+let isStartingPlayback = false;
+
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
@@ -436,6 +442,12 @@ function getEstimatedMasterPosition(): number {
 async function startPlayback(rawPosition: number): Promise<void> {
   if (!audioBuffer || !rawAudioData) return;
 
+  // Prevent concurrent calls: if a startPlayback is already in flight (async
+  // decode+resume), ignore this call. The in-flight call will start playback
+  // at the most recently requested position via the command queue serialisation.
+  if (isStartingPlayback) return;
+  isStartingPlayback = true;
+
   // Stop all timers and existing node
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
@@ -474,20 +486,28 @@ async function startPlayback(rawPosition: number): Promise<void> {
     audioBuffer = await ctx.decodeAudioData(rawAudioData.slice(0));
   } catch {
     // Decode failed — context may have been replaced by a newer call
+    isStartingPlayback = false;
     return;
   }
 
   // Guard: if context was replaced by a newer startPlayback call, bail out
-  if (ctx !== audioCtx) return;
+  if (ctx !== audioCtx) {
+    isStartingPlayback = false;
+    return;
+  }
 
   // Resume the fresh context — this always works on a newly-created context
   try { await ctx.resume(); } catch { /* ignore */ }
-  if (ctx !== audioCtx) return;
+  if (ctx !== audioCtx) {
+    isStartingPlayback = false;
+    return;
+  }
 
   // Guard: context must be running before we start the node
   if (ctx.state !== 'running') {
     // Extremely unlikely on a fresh context, but defer via pendingPlaybackPos
     pendingPlaybackPos = rawPosition;
+    isStartingPlayback = false;
     return;
   }
 
@@ -517,6 +537,10 @@ async function startPlayback(rawPosition: number): Promise<void> {
   playStartPos     = clamped;
   isPlaying        = true;
 
+  // Clear the in-flight guard BEFORE starting the drift loop so that
+  // future auto-resyncs from the drift loop are not blocked.
+  isStartingPlayback = false;
+
   // Start silent keepalive on the new context
   startSilentKeepalive();
 
@@ -529,6 +553,11 @@ async function startPlayback(rawPosition: number): Promise<void> {
 }
 
 function stopPlayback() {
+  // If a startPlayback() is in flight, cancel it by clearing the context
+  // reference. The in-flight call will see ctx !== audioCtx and bail out.
+  // Also reset the guard so the next startPlayback() call is not blocked.
+  isStartingPlayback = false;
+
   const node = sourceNode;
   sourceNode = null;
   if (node) {
@@ -591,7 +620,7 @@ function startDriftLoop() {
     // FIX 2: require 2 consecutive out-of-range readings before auto-resync
     if (driftMs > RESYNC_AHEAD_MS || driftMs < -RESYNC_BEHIND_MS) {
       driftOutOfRangeCount++;
-      if (driftOutOfRangeCount >= DRIFT_CONFIRM_COUNT) {
+      if (driftOutOfRangeCount >= DRIFT_CONFIRM_COUNT && !isStartingPlayback) {
         driftOutOfRangeCount = 0;
         resyncs++;
         statResyncs.textContent = String(resyncs);
