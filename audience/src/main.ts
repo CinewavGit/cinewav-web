@@ -37,6 +37,7 @@ interface ShowCommand {
   audioFile: string | null;
   receivedAt: number;
   clockOffsetMs: number;
+  enqueuedAt: number; // main-thread Date.now() at moment of enqueue — used for masterPositionAt
 }
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
@@ -126,9 +127,35 @@ let commandQueue: ShowCommand[] = [];
 let commandQueueRunning = false;
 
 function enqueueCommand(cmd: ShowCommand) {
-  // Drop all queued commands except the latest — only the most recent
-  // state matters. Keep any currently-executing command running.
-  commandQueue = [cmd];
+  // Stamp the command with the main-thread time at the moment it was enqueued.
+  // handleShowCommand uses enqueuedAt (not cmd.receivedAt from the SW thread)
+  // to set masterPositionAt. This ensures:
+  //   (a) both sides of the drift calculation use the same clock, and
+  //   (b) queue-wait time is accounted for — if a command waits 200ms in the
+  //       queue, masterPositionAt is 200ms earlier than Date.now() inside
+  //       handleShowCommand, so getEstimatedMasterPosition() correctly
+  //       advances masterPosition by those 200ms.
+  cmd.enqueuedAt = Date.now();
+
+  if (cmd.action === 'pause') {
+    // Pause must NEVER be dropped — it is the highest-priority command.
+    // Place it at the front of the queue so it runs immediately after the
+    // currently-executing command finishes. Discard any queued play/seek
+    // commands that are now stale.
+    commandQueue = [cmd];
+  } else {
+    // For play/seek/load: keep only the latest — stale intermediates are
+    // irrelevant since only the most recent master state matters.
+    // But never discard a queued pause.
+    const hasPause = commandQueue.some(c => c.action === 'pause');
+    if (hasPause) {
+      // A pause is waiting — don't replace it; append this after it.
+      commandQueue = [commandQueue.find(c => c.action === 'pause')!, cmd];
+    } else {
+      commandQueue = [cmd];
+    }
+  }
+
   if (!commandQueueRunning) drainCommandQueue();
 }
 
@@ -540,11 +567,15 @@ async function handleShowCommand(cmd: ShowCommand) {
     return;
   }
 
-  // FIX 1: always use Date.now() on the main thread for masterPositionAt.
-  // Do NOT use cmd.receivedAt (SW thread clock) — it can skew relative to
-  // the main thread clock, especially on iOS with screen lock throttling.
+  // FIX 1: use cmd.enqueuedAt (stamped on main thread when command entered
+  // the queue) rather than Date.now() here. By the time handleShowCommand
+  // runs, the command may have waited in the queue for 50–300ms while a
+  // previous command's await completed. Using enqueuedAt means
+  // masterPositionAt reflects when the command actually arrived, so
+  // getEstimatedMasterPosition() correctly advances position by the elapsed
+  // time since then.
   masterPosition   = cmd.position;
-  masterPositionAt = Date.now(); // FIX 1
+  masterPositionAt = cmd.enqueuedAt ?? Date.now(); // FIX 1
 
   switch (cmd.action) {
     case 'play': {
