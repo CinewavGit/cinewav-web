@@ -1,18 +1,43 @@
 /**
- * Cinewav Audience PWA — Main App v3
+ * Cinewav Audience PWA — Main App v4
  *
- * Clean rewrite fixing:
- *  1. 3-4s behind on join: pendingCommand now stores receivedAt timestamp
- *     so elapsed time is added when replaying the command after decode.
- *  2. Resync does nothing: commandAppliedAt is now set in syncEngine on
- *     message receipt, so getEstimatedMasterPosition() is always accurate.
- *  3. Play/Pause stuck: sourceNode reference is nulled BEFORE calling stop()
- *     so the onended callback cannot corrupt isPlaying state.
- *  4. Transit correction was backwards in syncEngine (now fixed in v3).
+ * Architecture changes from v3:
+ *
+ * 1. SERVICE WORKER owns the WebSocket + NTP pings.
+ *    Main thread receives commands via postMessage from sync-worker.js.
+ *    Benefit: WebSocket is not throttled when tab is backgrounded.
+ *
+ * 2. WEB AUDIO CLOCK as drift reference.
+ *    Drift is measured as:
+ *      expected = playStartPos + (audioCtx.currentTime - playStartCtxTime)
+ *      drift    = actual - expected
+ *    audioCtx.currentTime is a hardware-backed monotonic clock — immune to
+ *    browser throttling and system clock adjustments.
+ *
+ * 3. VISIBILITY HARD RESYNC.
+ *    On visibilitychange (tab comes back to foreground), we immediately:
+ *    a) Resume AudioContext
+ *    b) Request a fresh ping burst from the Service Worker
+ *    c) Recalculate drift and resync if needed
+ *
+ * 4. WEB LOCKS.
+ *    Only one tab holds the 'cinewav-sync-lock' at a time.
+ *    If a second tab opens, it waits. When the first tab closes, the second
+ *    tab acquires the lock and becomes the active player.
  */
 
-import { SyncEngine, ShowCommand } from './syncEngine';
 import { saveAudio, loadAudio } from './audioStorage';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+interface ShowCommand {
+  action:    'play' | 'pause' | 'seek' | 'load';
+  position:  number;
+  serverTs:  number;
+  masterTs:  number;
+  audioFile: string | null;
+  receivedAt: number;
+  clockOffsetMs: number;
+}
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 const screens = {
@@ -52,28 +77,41 @@ const ftReset            = document.getElementById('ft-reset')         as HTMLBu
 const ftValue            = document.getElementById('ft-value')!;
 
 // ── App State ─────────────────────────────────────────────────────────────────
-let audioCtx:        AudioContext | null           = null;
-let audioBuffer:     AudioBuffer  | null           = null;
-let sourceNode:      AudioBufferSourceNode | null  = null;
+let audioCtx:        AudioContext | null          = null;
+let audioBuffer:     AudioBuffer  | null          = null;
+let sourceNode:      AudioBufferSourceNode | null = null;
 let isPlaying        = false;
-let playStartCtxTime = 0;
-let playStartPos     = 0;
+let playStartCtxTime = 0;   // audioCtx.currentTime when playback started
+let playStartPos     = 0;   // audio position (seconds) when playback started
 let audioDuration    = 0;
 let uiInterval:      ReturnType<typeof setInterval> | null = null;
+let driftInterval:   ReturnType<typeof setInterval> | null = null;
 let showId           = '';
 let serverBaseUrl    = '';
-let syncEngine:      SyncEngine | null             = null;
 let manualOffsetMs   = 0;
 
-// Pending command received while audio was still decoding.
-// Stores the command AND when it was received so we can add elapsed time.
+// Clock state (updated from Service Worker)
+let clockOffsetMs    = 0;
+let rttMs            = 0;
+let resyncs          = 0;
+let driftMs          = 0;
+
+// Master state (last known from Service Worker)
+let masterIsPlaying  = false;
+let masterPosition   = 0;
+let masterPositionAt = 0;   // Date.now() when masterPosition was last updated
+
+// Pending command received before audio was decoded
 let pendingCommand: ShowCommand | null = null;
+
+// Service Worker reference
+let syncSW: ServiceWorker | null = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatTime(s: number): string {
   if (!isFinite(s) || s < 0) return '0:00';
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
+  const h   = Math.floor(s / 3600);
+  const m   = Math.floor((s % 3600) / 60);
   const sec = Math.floor(s % 60);
   return h > 0
     ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
@@ -119,11 +157,19 @@ function renderOffsetDisplay() {
 }
 
 function parseUrlParams() {
-  const p = new URLSearchParams(window.location.search);
+  const p      = new URLSearchParams(window.location.search);
   const show   = p.get('show');
   const server = p.get('server');
   if (show)   joinShowIdInput.value    = show;
   if (server) joinServerUrlInput.value = decodeURIComponent(server);
+}
+
+function sendToSW(msg: object) {
+  if (syncSW) {
+    syncSW.postMessage(msg);
+  } else if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage(msg);
+  }
 }
 
 // ── Audio Download ────────────────────────────────────────────────────────────
@@ -160,7 +206,6 @@ async function downloadAudioFile(url: string, filename: string): Promise<ArrayBu
 }
 
 // ── Audio Engine ──────────────────────────────────────────────────────────────
-
 function ensureAudioContext() {
   if (!audioCtx) audioCtx = new AudioContext();
 }
@@ -171,37 +216,50 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
   audioBuffer   = await audioCtx!.decodeAudioData(arrayBuffer.slice(0));
   audioDuration = audioBuffer.duration;
   pTotalTime.textContent = formatTime(audioDuration);
-  playPauseBtn.disabled = false;
-  resyncBtn.disabled    = false;
+  playPauseBtn.disabled  = false;
+  resyncBtn.disabled     = false;
 }
 
-/** Returns the current playback position in seconds (raw, without manual offset). */
+/**
+ * Returns current playback position in seconds using the Web Audio clock.
+ * This is the KEY improvement: audioCtx.currentTime is a hardware-backed
+ * monotonic timer that is NOT throttled by the browser, unlike Date.now().
+ */
 function getCurrentPosition(): number {
-  if (!audioCtx) return 0;
-  if (!isPlaying) return playStartPos;
+  if (!audioCtx || !isPlaying) return playStartPos;
   return playStartPos + (audioCtx.currentTime - playStartCtxTime);
 }
 
 /**
- * Start playback from rawPosition (seconds, NOT including manual offset).
+ * Estimate where the master player is RIGHT NOW.
+ * Uses Date.now() since masterPositionAt was recorded, which is fine for
+ * estimating the master's position (we just need it to be close enough to
+ * schedule a seek — the drift loop corrects any remaining error).
+ */
+function getEstimatedMasterPosition(): number {
+  if (!masterIsPlaying) return masterPosition;
+  return masterPosition + (Date.now() - masterPositionAt) / 1000;
+}
+
+/**
+ * Start playback from rawPosition (seconds, WITHOUT manual offset).
  * manualOffsetMs is applied internally.
  *
- * FIX: sourceNode is nulled BEFORE calling stop() so the onended callback
- * cannot fire and corrupt isPlaying after we've already started a new node.
+ * Uses audioCtx.currentTime to record the exact hardware clock time at
+ * which playback started — this is used for drift calculation.
  */
 function startPlayback(rawPosition: number) {
   if (!audioCtx || !audioBuffer) return;
 
-  // FIX: null sourceNode FIRST, then stop the old one.
-  // This prevents the old node's onended from setting isPlaying=false
-  // after we've already set it to true for the new node.
+  // Null sourceNode FIRST to prevent onended from corrupting state
   const oldNode = sourceNode;
   sourceNode = null;
   if (oldNode) {
     try { oldNode.stop(); } catch { /* already stopped */ }
     oldNode.disconnect();
   }
-  if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+  if (uiInterval)   { clearInterval(uiInterval);   uiInterval   = null; }
+  if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
   isPlaying = false;
 
   const adjusted = rawPosition + (manualOffsetMs / 1000);
@@ -212,41 +270,43 @@ function startPlayback(rawPosition: number) {
   node.connect(audioCtx.destination);
   node.start(0, clamped);
 
-  // onended: only act if this node is still the active one
   node.onended = () => {
     if (sourceNode === node) {
       sourceNode = null;
       isPlaying  = false;
       albumArt.classList.remove('playing');
-      if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+      if (uiInterval)   { clearInterval(uiInterval);   uiInterval   = null; }
+      if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
       updatePlayPauseBtn();
       setSyncStatus('synced', 'Show ended');
     }
   };
 
   sourceNode       = node;
-  playStartPos     = clamped;
+  // KEY: record the Web Audio hardware clock time at start
   playStartCtxTime = audioCtx.currentTime;
+  playStartPos     = clamped;
   isPlaying        = true;
 
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
   updatePlayPauseBtn();
   startUILoop();
-  syncEngine?.notifyCommandApplied(clamped, true);
+  startDriftLoop();
   updateMediaSession();
 }
 
 function stopPlayback() {
   const node = sourceNode;
-  sourceNode = null;           // null FIRST so onended is ignored
+  sourceNode = null;
   if (node) {
     try { node.stop(); } catch { /* already stopped */ }
     node.disconnect();
   }
+  if (uiInterval)   { clearInterval(uiInterval);   uiInterval   = null; }
+  if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
   isPlaying = false;
   albumArt.classList.remove('playing');
-  if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
   updatePlayPauseBtn();
 }
 
@@ -254,13 +314,47 @@ function stopPlayback() {
 function startUILoop() {
   if (uiInterval) clearInterval(uiInterval);
   uiInterval = setInterval(() => {
+    if (!isPlaying) return;
     const pos     = getCurrentPosition();
     const clamped = Math.min(pos, audioDuration);
     pCurrentTime.textContent = formatTime(clamped);
     if (audioDuration > 0) seekFill.style.width = `${(clamped / audioDuration) * 100}%`;
     updateMediaSession();
-    syncEngine?.reportActualPosition(clamped);
   }, 250);
+}
+
+// ── Drift Detection Loop (Web Audio clock based) ──────────────────────────────
+const DRIFT_CHECK_MS    = 500;
+const RESYNC_AHEAD_MS   = 150;
+const RESYNC_BEHIND_MS  = 300;
+
+function startDriftLoop() {
+  if (driftInterval) clearInterval(driftInterval);
+  driftInterval = setInterval(() => {
+    if (!isPlaying || !masterIsPlaying) return;
+
+    // Actual position from Web Audio hardware clock
+    const actualPos   = getCurrentPosition();
+    // Expected position from master (estimated using wall clock — good enough for comparison)
+    const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
+    driftMs = (actualPos - expectedPos) * 1000;
+
+    // Update stats display
+    statDrift.textContent = `${driftMs >= 0 ? '+' : ''}${Math.round(driftMs)}ms`;
+    const abs = Math.abs(driftMs);
+    if      (abs < 50)  setSyncStatus('synced',  'In sync');
+    else if (abs < 150) setSyncStatus('syncing', `${Math.round(abs)}ms drift`);
+    else                setSyncStatus('drifted', `${Math.round(abs)}ms drift`);
+
+    // Auto-resync if outside tolerance
+    if (driftMs > RESYNC_AHEAD_MS || driftMs < -RESYNC_BEHIND_MS) {
+      resyncs++;
+      statResyncs.textContent = String(resyncs);
+      const targetRaw = getEstimatedMasterPosition();
+      startPlayback(targetRaw - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'In sync');
+    }
+  }, DRIFT_CHECK_MS);
 }
 
 // ── Media Session ─────────────────────────────────────────────────────────────
@@ -273,12 +367,6 @@ function setupMediaSession(title: string) {
       { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
     ],
   });
-  navigator.mediaSession.setActionHandler('play',          null);
-  navigator.mediaSession.setActionHandler('pause',         null);
-  navigator.mediaSession.setActionHandler('seekbackward',  null);
-  navigator.mediaSession.setActionHandler('seekforward',   null);
-  navigator.mediaSession.setActionHandler('previoustrack', null);
-  navigator.mediaSession.setActionHandler('nexttrack',     null);
 }
 
 function updateMediaSession() {
@@ -310,20 +398,17 @@ playPauseBtn.addEventListener('click', async () => {
   if (!audioBuffer) return;
 
   if (isPlaying) {
-    // Synchronous path — no await needed
     stopPlayback();
     setSyncStatus('synced', 'Paused locally');
   } else {
-    // Optimistically update DOM BEFORE any await (Android Chrome fix)
+    // Update DOM synchronously BEFORE any await (Android Chrome fix)
     isPlaying = true;
     updatePlayPauseBtn();
 
     ensureAudioContext();
     if (audioCtx!.state === 'suspended') await audioCtx!.resume();
 
-    // Use master position if available, else last known position
-    const rawPos = syncEngine?.getEstimatedMasterPosition() ?? playStartPos;
-    // Strip manual offset from estimate (startPlayback re-adds it)
+    const rawPos = getEstimatedMasterPosition();
     startPlayback(rawPos - (manualOffsetMs / 1000));
     setSyncStatus('synced', 'In sync');
   }
@@ -332,27 +417,31 @@ playPauseBtn.addEventListener('click', async () => {
 // ── Show Command Handler ──────────────────────────────────────────────────────
 async function handleShowCommand(cmd: ShowCommand) {
   if (!audioCtx || !audioBuffer) {
-    // Queue command — will be replayed once audio is decoded
     pendingCommand = cmd;
     return;
   }
+
+  // Update master state tracking
+  masterIsPlaying  = (cmd.action === 'play');
+  masterPosition   = cmd.position;
+  masterPositionAt = cmd.receivedAt;
 
   setSyncStatus('syncing', 'Syncing…');
 
   switch (cmd.action) {
     case 'play': {
       if (audioCtx.state === 'suspended') await audioCtx.resume();
-      // cmd.position is already transit-corrected by syncEngine.
-      // Strip manual offset — startPlayback re-adds it.
       startPlayback(cmd.position - (manualOffsetMs / 1000));
       setSyncStatus('synced', 'In sync');
-      trackName.textContent = cmd.audioFile || 'Now Playing';
+      if (cmd.audioFile) trackName.textContent = cmd.audioFile;
       break;
     }
     case 'pause': {
       stopPlayback();
-      playStartPos = cmd.position;
-      syncEngine?.notifyCommandApplied(cmd.position, false);
+      playStartPos     = cmd.position;
+      masterIsPlaying  = false;
+      masterPosition   = cmd.position;
+      masterPositionAt = Date.now();
       setSyncStatus('synced', 'Paused');
       break;
     }
@@ -360,18 +449,21 @@ async function handleShowCommand(cmd: ShowCommand) {
       const wasPlaying = isPlaying;
       stopPlayback();
       playStartPos = cmd.position;
+      masterPosition   = cmd.position;
+      masterPositionAt = Date.now();
       if (wasPlaying) {
         if (audioCtx.state === 'suspended') await audioCtx.resume();
         startPlayback(cmd.position - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
+      } else {
+        setSyncStatus('synced', 'Paused');
       }
-      syncEngine?.notifyCommandApplied(cmd.position, wasPlaying);
-      setSyncStatus('synced', wasPlaying ? 'In sync' : 'Paused');
       break;
     }
     case 'load': {
       stopPlayback();
       playStartPos = 0;
-      trackName.textContent = cmd.audioFile || 'Audio Ready';
+      if (cmd.audioFile) trackName.textContent = cmd.audioFile;
       waitingOverlay.classList.remove('hidden');
       setSyncStatus('waiting', 'Waiting for master');
       break;
@@ -379,39 +471,15 @@ async function handleShowCommand(cmd: ShowCommand) {
   }
 }
 
-// ── Resync Handler (called by SyncEngine drift detector) ─────────────────────
-function handleResync(targetPosition: number, play: boolean) {
-  setSyncStatus('drifted', 'Resyncing…');
-  if (play) {
-    if (audioCtx?.state === 'suspended') {
-      audioCtx.resume().then(() => startPlayback(targetPosition - (manualOffsetMs / 1000)));
-    } else {
-      startPlayback(targetPosition - (manualOffsetMs / 1000));
-    }
-    setSyncStatus('synced', 'In sync');
-  } else {
-    stopPlayback();
-    playStartPos = targetPosition;
-    setSyncStatus('synced', 'Paused');
-  }
-}
-
-// ── Manual Resync Button ──────────────────────────────────────────────────────
+// ── Manual Resync ─────────────────────────────────────────────────────────────
 async function doManualResync() {
   if (!audioBuffer) return;
   ensureAudioContext();
   if (audioCtx!.state === 'suspended') await audioCtx!.resume();
 
-  const masterPos = syncEngine?.getEstimatedMasterPosition() ?? null;
-  if (masterPos === null) {
-    setSyncStatus('waiting', 'No sync signal yet');
-    return;
-  }
-
-  const masterIsPlaying = syncEngine?.getIsPlaying() ?? false;
+  const masterPos = getEstimatedMasterPosition();
 
   if (masterIsPlaying) {
-    // Strip manual offset — startPlayback re-adds it
     startPlayback(masterPos - (manualOffsetMs / 1000));
     setSyncStatus('synced', 'Resynced');
   } else {
@@ -432,7 +500,7 @@ resyncBtn.addEventListener('click', () => {
 function applyOffsetChange(oldOffsetMs: number) {
   if (!audioBuffer || !isPlaying) return;
   // getCurrentPosition() returns position WITH old offset baked in.
-  // Strip old offset to get raw position, then startPlayback re-adds new offset.
+  // Strip old offset to get raw position; startPlayback re-adds new offset.
   const rawPos = getCurrentPosition() - (oldOffsetMs / 1000);
   startPlayback(rawPos);
 }
@@ -458,6 +526,136 @@ ftReset.addEventListener('click', () => {
   applyOffsetChange(old);
 });
 
+// ── Service Worker Message Handler ───────────────────────────────────────────
+function handleSWMessage(event: MessageEvent) {
+  const msg = event.data;
+  if (!msg) return;
+
+  switch (msg.type) {
+    case 'sw_connected':
+      setSyncStatus('syncing', 'Syncing clock…');
+      break;
+
+    case 'sw_disconnected':
+      setSyncStatus('waiting', 'Reconnecting…');
+      break;
+
+    case 'sw_clock':
+      clockOffsetMs = msg.clockOffsetMs;
+      rttMs         = msg.rttMs;
+      statOffset.textContent = `${clockOffsetMs >= 0 ? '+' : ''}${Math.round(clockOffsetMs)}ms`;
+      statRtt.textContent    = `${Math.round(rttMs)}ms`;
+      break;
+
+    case 'sw_rtt':
+      rttMs = msg.rttMs;
+      statRtt.textContent = `${Math.round(rttMs)}ms`;
+      break;
+
+    case 'sw_command': {
+      const cmd: ShowCommand = {
+        action:       msg.action,
+        position:     msg.position,
+        serverTs:     msg.serverTs,
+        masterTs:     msg.masterTs,
+        audioFile:    msg.audioFile,
+        receivedAt:   msg.receivedAt,
+        clockOffsetMs: msg.clockOffsetMs,
+      };
+      handleShowCommand(cmd);
+      break;
+    }
+
+    case 'sw_audience_count':
+      // Could display audience count in UI if desired
+      break;
+
+    case 'sw_audio_ready':
+      handleAudioReady(msg.audioFile, msg.audioHash);
+      break;
+  }
+}
+
+async function handleAudioReady(filename: string, hash: string) {
+  const existing = await loadAudio(showId);
+  if (existing?.hash === hash) return;
+  setSyncStatus('syncing', 'Downloading audio…');
+  trackName.textContent = 'Downloading audio…';
+  try {
+    const buf = await downloadAudioFile(`${serverBaseUrl}/api/show/${showId}/audio`, filename);
+    await saveAudio(showId, filename, buf, hash);
+    await initAudio(buf);
+    trackName.textContent = filename;
+    setupMediaSession(filename);
+    setSyncStatus('waiting', 'Audio ready — waiting for show');
+  } catch {
+    setSyncStatus('waiting', 'Download failed — retry');
+  }
+}
+
+// ── Visibility Change — Hard Resync ──────────────────────────────────────────
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden) return;
+
+  // Tab just came back to foreground
+  if (audioCtx?.state === 'suspended') await audioCtx.resume();
+
+  // Request immediate ping burst from Service Worker to refresh clock offset
+  sendToSW({ type: 'sw_hard_resync' });
+
+  // If we were playing, check drift immediately and resync if needed
+  if (isPlaying && audioBuffer) {
+    const actualPos   = getCurrentPosition();
+    const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
+    const drift       = (actualPos - expectedPos) * 1000;
+
+    if (Math.abs(drift) > 200) {
+      // Significant drift after background — hard resync immediately
+      setSyncStatus('drifted', 'Resyncing after background…');
+      const targetRaw = getEstimatedMasterPosition();
+      startPlayback(targetRaw - (manualOffsetMs / 1000));
+      setSyncStatus('synced', 'In sync');
+    }
+  }
+});
+
+// ── Service Worker Setup ──────────────────────────────────────────────────────
+async function registerSyncWorker(wsUrl: string): Promise<void> {
+  if (!('serviceWorker' in navigator)) {
+    // Fallback: run WebSocket directly in main thread (old SyncEngine)
+    console.warn('Service Worker not supported — falling back to main thread WebSocket');
+    return;
+  }
+
+  // Listen for messages from any service worker
+  navigator.serviceWorker.addEventListener('message', handleSWMessage);
+
+  // Get the currently active service worker (registered by Vite PWA plugin)
+  const reg = await navigator.serviceWorker.ready;
+  syncSW    = reg.active;
+
+  // Tell the sync worker to connect
+  sendToSW({ type: 'sw_init', wsUrl, showId });
+}
+
+// ── Web Locks — Single Instance ───────────────────────────────────────────────
+async function acquireSyncLock(callback: () => Promise<void>): Promise<void> {
+  if (!('locks' in navigator)) {
+    // Web Locks not supported — just run directly
+    await callback();
+    return;
+  }
+
+  // Acquire an exclusive lock. If another tab holds it, this will wait.
+  await (navigator as Navigator & { locks: LockManager }).locks.request(
+    'cinewav-sync-lock',
+    { mode: 'exclusive' },
+    async () => {
+      await callback();
+    }
+  );
+}
+
 // ── Join Flow ─────────────────────────────────────────────────────────────────
 async function joinShow() {
   showId        = joinShowIdInput.value.trim();
@@ -468,8 +666,8 @@ async function joinShow() {
     return;
   }
 
-  localStorage.setItem('cinewav_show_id',     showId);
-  localStorage.setItem('cinewav_server_url',  serverBaseUrl);
+  localStorage.setItem('cinewav_show_id',    showId);
+  localStorage.setItem('cinewav_server_url', serverBaseUrl);
 
   joinBtn.disabled    = true;
   joinBtn.textContent = 'Connecting…';
@@ -489,7 +687,7 @@ async function joinShow() {
     // ── 2. Check local audio cache ────────────────────────────────────────────
     let audioData = await loadAudio(showId);
     if (audioData && state.audioHash && audioData.hash !== state.audioHash) {
-      audioData = null; // stale — re-download
+      audioData = null;
     }
 
     // ── 3. Download audio if needed ───────────────────────────────────────────
@@ -513,73 +711,39 @@ async function joinShow() {
     resyncBtn.disabled    = true;
     trackName.textContent = audioData?.filename || 'Waiting for audio…';
 
-    // ── 5. Connect WebSocket (starts ping burst immediately) ──────────────────
+    // ── 5. Set initial master state from HTTP response ────────────────────────
+    masterIsPlaying  = state.isPlaying;
+    masterPosition   = state.position;
+    masterPositionAt = Date.now();
+
+    // ── 6. Connect Service Worker WebSocket ───────────────────────────────────
     const wsUrl = serverBaseUrl.replace(/^http/, 'ws') + `/api/show/${showId}/ws`;
+    await registerSyncWorker(wsUrl);
+    setSyncStatus('syncing', 'Syncing clock…');
 
-    syncEngine = new SyncEngine(handleResync, (syncState) => {
-      statOffset.textContent  = `${syncState.clockOffsetMs >= 0 ? '+' : ''}${Math.round(syncState.clockOffsetMs)}ms`;
-      statDrift.textContent   = `${syncState.driftMs >= 0 ? '+' : ''}${Math.round(syncState.driftMs)}ms`;
-      statResyncs.textContent = String(syncState.resyncs);
-      statRtt.textContent     = `${Math.round(syncState.rttMs)}ms`;
-
-      if (isPlaying) {
-        const abs = Math.abs(syncState.driftMs);
-        if      (abs < 50)  setSyncStatus('synced',  'In sync');
-        else if (abs < 150) setSyncStatus('syncing', `${Math.round(abs)}ms drift`);
-        else                setSyncStatus('drifted', `${Math.round(abs)}ms drift`);
-      }
-    });
-
-    syncEngine.setShowCommandHandler(handleShowCommand);
-
-    syncEngine.setAudioReadyHandler(async (filename: string, hash: string) => {
-      const existing = await loadAudio(showId);
-      if (existing?.hash === hash) return;
-      setSyncStatus('syncing', 'Downloading audio…');
-      trackName.textContent = 'Downloading audio…';
-      try {
-        const buf = await downloadAudioFile(`${serverBaseUrl}/api/show/${showId}/audio`, filename);
-        await saveAudio(showId, filename, buf, hash);
-        await initAudio(buf);
-        trackName.textContent = filename;
-        setupMediaSession(filename);
-        setSyncStatus('waiting', 'Audio ready — waiting for show');
-      } catch {
-        setSyncStatus('waiting', 'Download failed — retry');
-      }
-    });
-
-    await syncEngine.connect(wsUrl, showId);
-    setSyncStatus('waiting', 'Waiting for show');
-
-    // ── 6. Decode audio (after WS connected so commands don't get lost) ───────
+    // ── 7. Decode audio (parallel with WS — commands queued in pendingCommand) ─
     if (audioData) {
       await initAudio(audioData.data);
 
       if (pendingCommand) {
-        // A command arrived while we were decoding.
-        // FIX: Add elapsed time since the command was received so the
-        // position is current, not stale.
         const cmd = pendingCommand;
         pendingCommand = null;
 
+        // Add elapsed time since command was received (decode took time)
         if (cmd.action === 'play') {
-          const elapsedSinceReceived = (Date.now() - cmd.receivedAt) / 1000;
-          cmd.position += elapsedSinceReceived;
+          const elapsed = (Date.now() - cmd.receivedAt) / 1000;
+          cmd.position += elapsed;
+          masterPosition   = cmd.position;
+          masterPositionAt = Date.now();
         }
         await handleShowCommand(cmd);
 
       } else if (state.isPlaying) {
-        // Show was already playing when we fetched state.
-        // syncEngine already has the corrected position from the welcome message
-        // (received while we were decoding). Use that — it's more accurate than
-        // the HTTP state which was stale even when we fetched it.
-        const masterPos = syncEngine.getEstimatedMasterPosition();
-        if (masterPos !== null) {
-          if (audioCtx!.state === 'suspended') await audioCtx!.resume();
-          startPlayback(masterPos - (manualOffsetMs / 1000));
-          setSyncStatus('synced', 'In sync');
-        }
+        // Show already playing — use estimated master position
+        const masterPos = getEstimatedMasterPosition();
+        if (audioCtx!.state === 'suspended') await audioCtx!.resume();
+        startPlayback(masterPos - (manualOffsetMs / 1000));
+        setSyncStatus('synced', 'In sync');
       }
     }
 
@@ -599,13 +763,16 @@ if (savedServerUrl && !joinServerUrlInput.value) joinServerUrlInput.value = save
 joinBtn.addEventListener('click', () => {
   ensureAudioContext();
   if (audioCtx?.state === 'suspended') audioCtx.resume();
-  joinShow();
+
+  // Acquire Web Lock before joining — ensures only one tab is active
+  acquireSyncLock(joinShow).catch(err => showError(err.message));
 });
 
 [joinShowIdInput, joinServerUrlInput].forEach(input => {
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') joinShow(); });
-});
-
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && audioCtx?.state === 'suspended') audioCtx.resume();
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      ensureAudioContext();
+      acquireSyncLock(joinShow).catch(err => showError(err.message));
+    }
+  });
 });

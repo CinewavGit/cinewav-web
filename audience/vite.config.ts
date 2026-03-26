@@ -12,8 +12,17 @@ export default defineConfig({
   },
   plugins: [
     VitePWA({
+      // Use our custom service worker instead of Workbox auto-generation.
+      // 'injectManifest' tells Vite PWA to compile our custom SW file and
+      // inject the precache manifest into it.
+      strategies: 'injectManifest',
+      srcDir: 'public',
+      filename: 'sync-worker.js',
       registerType: 'autoUpdate',
-      includeAssets: ['favicon.svg', 'apple-touch-icon.png'],
+      injectManifest: {
+        // Don't inject a precache manifest — our SW handles fetch pass-through
+        injectionPoint: undefined,
+      },
       manifest: {
         name: 'Cinewav — Audience',
         short_name: 'Cinewav',
@@ -26,12 +35,6 @@ export default defineConfig({
           { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
           { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
         ],
-      },
-      workbox: {
-        // Cache the app shell
-        globPatterns: ['**/*.{js,css,html,svg,png}'],
-        // Don't cache audio files — they are stored in IndexedDB
-        navigateFallback: 'index.html',
       },
     }),
   ],
