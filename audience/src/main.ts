@@ -354,6 +354,7 @@ async function startPlayback(rawPosition: number): Promise<void> {
 function stopPlayback() {
   if (audioEl) {
     audioEl.pause();
+    audioEl.playbackRate = 1.0;  // reset any drift nudge
     playStartPos = audioEl.currentTime;
   }
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
@@ -372,36 +373,49 @@ function startUILoop() {
     const clamped = Math.min(pos, audioDuration);
     pCurrentTime.textContent = formatTime(clamped);
     if (audioDuration > 0) seekFill.style.width = `${(clamped / audioDuration) * 100}%`;
-    updateMediaSession();
+    // NOTE: Do NOT call updateMediaSession() here. Calling setPositionState()
+    // every 250ms causes iOS to treat each update as a media event, producing
+    // audible interruptions. The OS reads position from the HTMLAudioElement
+    // directly — no need to push it manually.
   }, 250);
 }
 
 // ── Drift Detection Loop ──────────────────────────────────────────────────────
-const DRIFT_CHECK_MS   = 500;
-const RESYNC_AHEAD_MS  = 150;
-const RESYNC_BEHIND_MS = 300;
-
+const DRIFT_CHECK_MS      = 500;
+// Hard-seek thresholds — only interrupt playback for large drift.
+// Small drift is corrected silently via playbackRate nudge (no seek interruption).
+const HARD_RESYNC_MS      = 500;   // hard seek if drift exceeds ±500ms
+const RATE_NUDGE_MAX_MS   = 499;   // use playbackRate nudge for drift up to 499ms
+const RATE_NUDGE_FACTOR   = 0.05;  // max ±5% speed adjustment
 function startDriftLoop() {
   if (driftInterval) clearInterval(driftInterval);
   driftInterval = setInterval(() => {
     if (!isPlaying || !masterIsPlaying || !audioEl) return;
-
     const actualPos   = audioEl.currentTime;
     const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
     driftMs = (actualPos - expectedPos) * 1000;
-
     statDrift.textContent = `${driftMs >= 0 ? '+' : ''}${Math.round(driftMs)}ms`;
     const abs = Math.abs(driftMs);
     if      (abs < 50)  setSyncStatus('synced',  'In sync');
     else if (abs < 150) setSyncStatus('syncing', `${Math.round(abs)}ms drift`);
     else                setSyncStatus('drifted', `${Math.round(abs)}ms drift`);
-
-    if (driftMs > RESYNC_AHEAD_MS || driftMs < -RESYNC_BEHIND_MS) {
+    if (abs >= HARD_RESYNC_MS) {
+      // Large drift: hard seek (interrupts playback but necessary)
       resyncs++;
       statResyncs.textContent = String(resyncs);
       const targetRaw = getEstimatedMasterPosition();
+      audioEl.playbackRate = 1.0;
       startPlayback(targetRaw - (manualOffsetMs / 1000));
       setSyncStatus('synced', 'In sync');
+    } else if (abs > 30) {
+      // Small/medium drift: nudge playbackRate to converge without seeking.
+      // driftMs > 0 means we are AHEAD of master → slow down (rate < 1)
+      // driftMs < 0 means we are BEHIND master → speed up (rate > 1)
+      const nudge = Math.min(RATE_NUDGE_FACTOR, abs / 1000);
+      audioEl.playbackRate = driftMs > 0 ? 1.0 - nudge : 1.0 + nudge;
+    } else {
+      // Within 30ms — restore normal rate
+      audioEl.playbackRate = 1.0;
     }
   }, DRIFT_CHECK_MS);
 }
@@ -426,15 +440,11 @@ function setupMediaSession(title: string) {
 
 function updateMediaSession() {
   if (!('mediaSession' in navigator) || !audioEl) return;
+  // Only update playbackState — do NOT call setPositionState() here.
+  // setPositionState() triggers OS media events on iOS/Android which cause
+  // audible interruptions when called frequently. The OS reads currentTime
+  // directly from the HTMLAudioElement.
   navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
-  if (audioDuration > 0) {
-    try {
-      navigator.mediaSession.setPositionState({
-        duration: audioDuration, playbackRate: 1,
-        position: Math.min(audioEl.currentTime, audioDuration),
-      });
-    } catch { /* not supported on all browsers */ }
-  }
 }
 
 // ── Play/Pause Button ─────────────────────────────────────────────────────────
