@@ -926,6 +926,14 @@ function startDirectWebSocket(wsUrl: string) {
 
 // ── Join Flow ─────────────────────────────────────────────────────────────────
 async function joinShow() {
+  // iOS Safari: the AudioContext MUST be created and resumed synchronously
+  // inside a user gesture handler. Any await before this point causes the
+  // gesture context to expire, leaving the AudioContext permanently suspended
+  // with no audio output. Create it here — before any async work — so the
+  // gesture is still active.
+  ensureAudioContext();
+  try { audioCtx!.resume(); } catch { /* ignore — will retry in initAudio */ }
+
   showId        = joinShowIdInput.value.trim();
   serverBaseUrl = joinServerUrlInput.value.trim().replace(/\/$/, '');
 
