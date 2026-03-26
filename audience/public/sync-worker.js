@@ -275,7 +275,13 @@ self.addEventListener('message', (event) => {
 
     case 'sw_hard_resync': {
       // Main thread requests immediate position — send a ping burst
+      // AND request a fresh sync message from the server
       startBurst();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        // Send a 'resync' request to the server — it will reply with a 'sync' message
+        // containing the current authoritative state (position, isPlaying)
+        ws.send(JSON.stringify({ type: 'resync' }));
+      }
       break;
     }
   }

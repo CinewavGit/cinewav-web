@@ -202,6 +202,20 @@ export class ShowRoom {
         break;
       }
 
+      case 'resync': {
+        // Audience client requesting fresh authoritative state
+        // Reply with a sync message containing current show state
+        ws.send(JSON.stringify({
+          type:      'sync',
+          action:    this.showState.isPlaying ? 'play' : 'pause',
+          position:  this.showState.position,
+          masterTs:  this.showState.masterTs,
+          serverTs:  Date.now(),
+          audioFile: this.showState.audioFile,
+        }));
+        break;
+      }
+
       case 'leave': {
         const attachment = ws.deserializeAttachment() as { clientId?: string } | null;
         if (attachment?.clientId) {

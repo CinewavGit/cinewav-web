@@ -124,11 +124,14 @@ let uiInterval:    ReturnType<typeof setInterval> | null = null;
 let driftInterval: ReturnType<typeof setInterval> | null = null;
 
 // Drift thresholds (per spec)
-const DRIFT_CHECK_MS     = 500;   // check every 500ms
-const RESYNC_AHEAD_MS    = 150;   // resync if >150ms ahead of master
-const RESYNC_BEHIND_MS   = 300;   // resync if >300ms behind master
-const RESYNC_COOLDOWN_MS = 3000;  // minimum 3s between automatic resyncs
-let   lastResyncAt       = 0;
+const DRIFT_CHECK_MS        = 500;   // check every 500ms
+const RESYNC_AHEAD_MS       = 150;   // resync if >150ms ahead of master
+const RESYNC_BEHIND_MS      = 300;   // resync if >300ms behind master
+const RESYNC_COOLDOWN_MS    = 3000;  // minimum 3s between automatic resyncs
+const RESYNC_CONFIRM_CHECKS = 2;     // require N consecutive out-of-range readings before resyncing
+                                     // prevents a single noisy clock reading from triggering a glitch
+let   lastResyncAt          = 0;
+let   driftOutOfRangeCount  = 0;     // consecutive out-of-range drift readings
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function formatTime(s: number): string {
@@ -402,9 +405,10 @@ async function startPlayback(rawPosition: number): Promise<void> {
 
   isSeekingInternal = false;
 
-  // Reset the resync cooldown from NOW so the drift loop doesn't immediately
-  // fire again after we just seeked.
-  lastResyncAt = Date.now();
+  // Reset the resync cooldown and consecutive-drift counter from NOW so the
+  // drift loop doesn't immediately fire again after we just seeked.
+  lastResyncAt         = Date.now();
+  driftOutOfRangeCount = 0;
 
   isPlaying = true;
   albumArt.classList.add('playing');
@@ -448,10 +452,19 @@ function startDriftLoop() {
     //  - ahead by more than RESYNC_AHEAD_MS (+150ms), OR
     //  - behind by more than RESYNC_BEHIND_MS (-300ms)
     // AND the cooldown has elapsed (prevents thrash)
+    // AND we've seen N consecutive out-of-range readings (prevents single noisy
+    //   clock sample from triggering a glitch)
     const needsResync = (driftMs > RESYNC_AHEAD_MS) || (driftMs < -RESYNC_BEHIND_MS);
     const cooldownOk  = (Date.now() - lastResyncAt) >= RESYNC_COOLDOWN_MS;
 
-    if (needsResync && cooldownOk && masterIsPlaying) {
+    if (needsResync) {
+      driftOutOfRangeCount++;
+    } else {
+      driftOutOfRangeCount = 0;  // reset on any in-range reading
+    }
+
+    if (needsResync && cooldownOk && masterIsPlaying && driftOutOfRangeCount >= RESYNC_CONFIRM_CHECKS) {
+      driftOutOfRangeCount = 0;
       resyncs++;
       statResyncs.textContent = String(resyncs);
       setSyncStatus('syncing', 'Auto-resyncing…');
@@ -531,21 +544,26 @@ async function handleShowCommand(cmd: ShowCommand) {
   }
 
   // Update master state.
-  // For 'seek' (master paused, seeking): preserve masterIsPlaying.
-  // The master sends 'play' when seeking while playing, so 'seek' always
-  // means the master is paused at a new position.
+  // IMPORTANT: masterPositionAt MUST use Date.now() on the main thread.
+  // cmd.receivedAt is from the SW thread clock, which can skew relative to
+  // the main thread clock on iOS (especially with screen lock throttling).
+  // Using two different clocks in the drift calculation causes false drift readings.
+  //
+  // Transit correction is already baked into cmd.position by the SW's
+  // broadcastCommand() function for 'play' actions.
+  const now = Date.now();
   if (cmd.action === 'play') {
     masterIsPlaying  = true;
     masterPosition   = cmd.position;
-    masterPositionAt = cmd.receivedAt;
+    masterPositionAt = now;
   } else if (cmd.action === 'pause') {
     masterIsPlaying  = false;
     masterPosition   = cmd.position;
-    masterPositionAt = Date.now();
+    masterPositionAt = now;
   } else if (cmd.action === 'seek') {
     masterIsPlaying  = false;  // seek is only sent when paused
     masterPosition   = cmd.position;
-    masterPositionAt = Date.now();
+    masterPositionAt = now;
   }
   // 'load' doesn't update position tracking
 
