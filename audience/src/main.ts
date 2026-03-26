@@ -327,7 +327,14 @@ function ensureAudioContext() {
       }
     } catch { /* ignore — not supported on this platform */ }
 
-    audioCtx = new AudioContext();
+    // Android fix D: use latencyHint 'playback' when creating the AudioContext.
+    // This tells Android Chrome to treat this as a long-form media playback
+    // session (like a music player) rather than an interactive app. It uses
+    // larger audio buffers and prevents the OS from aggressively suspending
+    // the context after repeated stop/start cycles during rapid seeks.
+    // Reference: https://github.com/carlosrafaelgn/FPlayWeb — the only known
+    // Web Audio player that reliably survives Android screen-off + seek cycles.
+    audioCtx = new AudioContext({ latencyHint: 'playback' });
     attachAudioContextListeners(audioCtx);
   }
 }
@@ -501,6 +508,14 @@ function stopPlayback() {
   driftOutOfRangeCount = 0;
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
+  // Android fix D: explicitly suspend the AudioContext when not playing.
+  // This prevents Android from auto-suspending it unpredictably due to
+  // perceived inactivity. We control the lifecycle explicitly: suspend on
+  // stop, resume on start. This matches the FPlayWeb strategy that survives
+  // repeated seek cycles on Android Chrome.
+  if (audioCtx && audioCtx.state === 'running') {
+    audioCtx.suspend().catch(() => {});
+  }
 }
 
 // ── UI Loop ───────────────────────────────────────────────────────────────────
