@@ -256,6 +256,23 @@ async function initAudio(arrayBuffer: ArrayBuffer): Promise<void> {
         setSyncStatus('synced', 'Show ended');
       }
     });
+    // When the OS pauses the element externally (e.g. Android screen lock,
+    // phone call, Bluetooth disconnect) — track the state change so the
+    // visibilitychange handler knows to restart on wake.
+    audioEl.addEventListener('pause', () => {
+      // Only update isPlaying if WE didn't initiate the pause via stopPlayback().
+      // stopPlayback() sets isPlaying=false before calling audioEl.pause(), so
+      // by the time this fires isPlaying is already false — this is a no-op.
+      // If the OS paused it externally, isPlaying is still true here — fix it.
+      if (isPlaying) {
+        isPlaying = false;
+        if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
+        if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
+        albumArt.classList.remove('playing');
+        updatePlayPauseBtn();
+        updateMediaSession();
+      }
+    });
 
     // When audio is ready to play, update duration display
     audioEl.addEventListener('loadedmetadata', () => {
@@ -313,24 +330,27 @@ function getEstimatedMasterPosition(): number {
  */
 async function startPlayback(rawPosition: number): Promise<void> {
   if (!audioEl || audioDuration === 0) return;
-
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
-
   const adjusted = rawPosition + (manualOffsetMs / 1000);
   const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.05));
-
+  // Always pause before seeking. On iOS Safari, setting currentTime while
+  // the element is playing fires a seeking event that can cause the subsequent
+  // play() call to get an AbortError, silently dropping the command.
+  // Pausing first ensures the seek completes cleanly before play() is called.
+  if (!audioEl.paused) audioEl.pause();
   // Seek to position
   audioEl.currentTime = clamped;
   playStartPos      = clamped;
   playStartWallMs   = performance.now();
-
-  // Play — returns a promise; catch AbortError from rapid seek/play cycles
+  // Play — returns a promise; catch errors from rapid seek/play cycles
   try {
     await audioEl.play();
   } catch (err: unknown) {
-    // AbortError is expected when seek interrupts a pending play — ignore
-    if (err instanceof Error && err.name === 'AbortError') return;
+    if (err instanceof Error && err.name === 'AbortError') {
+      // AbortError: a newer play() call superseded this one — safe to ignore
+      return;
+    }
     // NotAllowedError means we need a user gesture — mark as pending
     if (err instanceof Error && err.name === 'NotAllowedError') {
       isPlaying = false;
@@ -341,7 +361,6 @@ async function startPlayback(rawPosition: number): Promise<void> {
     console.warn('[Audio] play() error:', err);
     return;
   }
-
   isPlaying = true;
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
