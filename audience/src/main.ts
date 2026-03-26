@@ -622,20 +622,130 @@ document.addEventListener('visibilitychange', async () => {
 // ── Service Worker Setup ──────────────────────────────────────────────────────
 async function registerSyncWorker(wsUrl: string): Promise<void> {
   if (!('serviceWorker' in navigator)) {
-    // Fallback: run WebSocket directly in main thread (old SyncEngine)
-    console.warn('Service Worker not supported — falling back to main thread WebSocket');
+    console.warn('SW not supported — using direct WebSocket');
+    startDirectWebSocket(wsUrl);
     return;
   }
 
-  // Listen for messages from any service worker
+  // Always listen for messages from the SW
   navigator.serviceWorker.addEventListener('message', handleSWMessage);
 
-  // Get the currently active service worker (registered by Vite PWA plugin)
-  const reg = await navigator.serviceWorker.ready;
-  syncSW    = reg.active;
+  // Helper to send sw_init to a specific SW
+  const initSW = (sw: ServiceWorker) => {
+    syncSW = sw;
+    sw.postMessage({ type: 'sw_init', wsUrl, showId });
+    console.log('[SW] sw_init sent to', sw.state);
+  };
 
-  // Tell the sync worker to connect
-  sendToSW({ type: 'sw_init', wsUrl, showId });
+  // If we already have a controller (most page loads after first), use it immediately
+  if (navigator.serviceWorker.controller) {
+    initSW(navigator.serviceWorker.controller);
+    return;
+  }
+
+  // Otherwise wait up to 4 seconds for the SW to install and claim the page
+  // If it doesn't happen in time, fall back to direct WebSocket
+  await new Promise<void>(resolve => {
+    let resolved = false;
+    const done = (useSW: boolean, sw?: ServiceWorker) => {
+      if (resolved) return;
+      resolved = true;
+      if (useSW && sw) {
+        initSW(sw);
+      } else {
+        console.warn('[SW] Timed out waiting for controller — using direct WebSocket');
+        startDirectWebSocket(wsUrl);
+      }
+      resolve();
+    };
+
+    // Timeout fallback
+    const timeout = setTimeout(() => done(false), 4000);
+
+    // Listen for controller to become available
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      clearTimeout(timeout);
+      done(true, navigator.serviceWorker.controller!);
+    }, { once: true });
+
+    // Also check if ready resolves with an active SW that can claim
+    navigator.serviceWorker.ready.then(reg => {
+      if (navigator.serviceWorker.controller) {
+        clearTimeout(timeout);
+        done(true, navigator.serviceWorker.controller);
+      } else if (reg.active) {
+        // SW is active but hasn't claimed yet — it will fire controllerchange soon
+        // The timeout above will catch it
+      }
+    });
+  });
+}
+
+// ── Fallback: Direct WebSocket (when Service Worker not available) ─────────────
+function startDirectWebSocket(wsUrl: string) {
+  const ws = new WebSocket(wsUrl);
+  let clockOffsetDirect = 0;
+  let pingTimerDirect: ReturnType<typeof setInterval> | null = null;
+  let burstSentDirect = 0;
+  const BURST = 16;
+  const rttHist: number[] = [];
+  const offHist: number[] = [];
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'join', role: 'audience', clientId: `direct-${Date.now()}` }));
+    const burst = () => {
+      ws.send(JSON.stringify({ type: 'ping', clientTs: Date.now() }));
+      burstSentDirect++;
+      if (burstSentDirect < BURST) setTimeout(burst, 75);
+      else pingTimerDirect = setInterval(() => ws.send(JSON.stringify({ type: 'ping', clientTs: Date.now() })), 4000);
+    };
+    burst();
+    handleSWMessage({ data: { type: 'sw_connected' } } as MessageEvent);
+  };
+
+  ws.onmessage = (e) => {
+    let msg: Record<string, unknown>;
+    try { msg = JSON.parse(e.data); } catch { return; }
+
+    if (msg.type === 'pong') {
+      const clientTs = msg.clientTs as number;
+      const serverTs = msg.serverTs as number;
+      const now = Date.now();
+      const rtt = now - clientTs;
+      rttHist.push(rtt); if (rttHist.length > 8) rttHist.shift();
+      const offset = serverTs - (clientTs + rtt / 2);
+      offHist.push(offset); if (offHist.length > 16) offHist.shift();
+      const sorted = [...offHist].sort((a, b) => a - b);
+      clockOffsetDirect = sorted[Math.floor(sorted.length / 2)];
+      handleSWMessage({ data: { type: 'sw_clock', clockOffsetMs: clockOffsetDirect, rttMs: rtt, burstComplete: burstSentDirect >= BURST } } as MessageEvent);
+      return;
+    }
+
+    if (msg.type === 'welcome' || msg.type === 'sync') {
+      const receivedAt = Date.now();
+      const rawPos = (msg.position as number) || 0;
+      const serverTs = (msg.serverTs as number) || receivedAt;
+      const isPlay = !!(msg.isPlaying || msg.action === 'play');
+      const action = (msg.action as string) || (isPlay ? 'play' : 'pause');
+      let correctedPos = rawPos;
+      if (action === 'play') {
+        const serverNow = receivedAt + clockOffsetDirect;
+        const transit = Math.max(0, serverNow - serverTs);
+        correctedPos = rawPos + transit / 1000;
+      }
+      handleSWMessage({ data: { type: 'sw_command', action, position: correctedPos, serverTs, masterTs: msg.masterTs || 0, audioFile: msg.audioFile || null, receivedAt, clockOffsetMs: clockOffsetDirect } } as MessageEvent);
+    }
+
+    if (msg.type === 'audio_ready') {
+      handleSWMessage({ data: { type: 'sw_audio_ready', audioFile: msg.audioFile, audioHash: msg.audioHash } } as MessageEvent);
+    }
+  };
+
+  ws.onclose = () => {
+    if (pingTimerDirect) clearInterval(pingTimerDirect);
+    handleSWMessage({ data: { type: 'sw_disconnected' } } as MessageEvent);
+    setTimeout(() => startDirectWebSocket(wsUrl), 3000);
+  };
 }
 
 // ── Web Locks — Single Instance ───────────────────────────────────────────────
@@ -763,16 +873,14 @@ if (savedServerUrl && !joinServerUrlInput.value) joinServerUrlInput.value = save
 joinBtn.addEventListener('click', () => {
   ensureAudioContext();
   if (audioCtx?.state === 'suspended') audioCtx.resume();
-
-  // Acquire Web Lock before joining — ensures only one tab is active
-  acquireSyncLock(joinShow).catch(err => showError(err.message));
+  joinShow().catch(err => showError(err instanceof Error ? err.message : String(err)));
 });
 
 [joinShowIdInput, joinServerUrlInput].forEach(input => {
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter') {
       ensureAudioContext();
-      acquireSyncLock(joinShow).catch(err => showError(err.message));
+      joinShow().catch(err => showError(err instanceof Error ? err.message : String(err)));
     }
   });
 });

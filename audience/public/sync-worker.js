@@ -25,7 +25,7 @@ const OFFSET_HISTORY_SIZE   = 16;
 const RTT_HISTORY_SIZE      = 8;
 const RTT_OUTLIER_FACTOR    = 2.5;
 
-// ── State ─────────────────────────────────────────────────────────────────────
+//// ── State ───────────────────────────────────────────────────────────────────
 let ws             = null;
 let wsUrl          = null;
 let showId         = null;
@@ -38,6 +38,10 @@ let offsetHistory  = [];
 let rttHistory     = [];
 let clockOffsetMs  = 0;
 let rttMs          = 0;
+
+// Buffer the welcome message until we have enough pings for a good clock offset
+const MIN_PINGS_BEFORE_WELCOME = 8;
+let pendingWelcome = null;
 
 // ── Broadcast to all clients ──────────────────────────────────────────────────
 async function broadcast(msg) {
@@ -132,6 +136,35 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(connectWs, 3000);
 }
 
+function broadcastCommand(msg) {
+  const receivedAt  = msg.receivedAt || Date.now();
+  const rawPosition = msg.position || 0;
+  const serverTs    = msg.serverTs  || receivedAt;
+  const isPlay      = !!(msg.isPlaying || msg.action === 'play');
+  const action      = msg.action || (isPlay ? 'play' : 'pause');
+
+  // Transit correction: how many ms elapsed on the server clock since the command was sent?
+  // serverNow = clientNow + clockOffsetMs  (converts client wall-clock to server clock)
+  // transitMs = serverNow - serverTs       (time since command was dispatched)
+  let correctedPosition = rawPosition;
+  if (action === 'play') {
+    const serverNow = receivedAt + clockOffsetMs;
+    const transitMs = Math.max(0, serverNow - serverTs);
+    correctedPosition = rawPosition + transitMs / 1000;
+  }
+
+  broadcast({
+    type:         'sw_command',
+    action,
+    position:     correctedPosition,
+    serverTs,
+    masterTs:     msg.masterTs  || 0,
+    audioFile:    msg.audioFile || null,
+    receivedAt,
+    clockOffsetMs,
+  });
+}
+
 function handleServerMessage(msg) {
   switch (msg.type) {
 
@@ -163,36 +196,25 @@ function handleServerMessage(msg) {
         rttMs,
         burstComplete,
       });
+
+      // Flush buffered welcome message once we have enough offset samples
+      if (pendingWelcome && offsetHistory.length >= MIN_PINGS_BEFORE_WELCOME) {
+        const welcome = pendingWelcome;
+        pendingWelcome = null;
+        broadcastCommand(welcome);
+      }
       break;
     }
 
     case 'welcome':
     case 'sync': {
-      const receivedAt  = Date.now();
-      const rawPosition = (msg.position) || 0;
-      const serverTs    = (msg.serverTs) || receivedAt;
-      const isPlaying   = !!(msg.isPlaying || msg.action === 'play');
-      const action      = msg.action || (isPlaying ? 'play' : 'pause');
-
-      // Transit correction using the Service Worker's clock offset
-      // (which is computed from NTP pings, same as before but now in SW)
-      let correctedPosition = rawPosition;
-      if (action === 'play') {
-        const serverNow  = receivedAt + clockOffsetMs;
-        const transitMs  = Math.max(0, serverNow - serverTs);
-        correctedPosition = rawPosition + transitMs / 1000;
+      if (msg.type === 'welcome' && offsetHistory.length < MIN_PINGS_BEFORE_WELCOME) {
+        // Clock not ready yet — buffer the welcome and send once we have enough pings
+        // Store raw message with receivedAt so we can correct transit time later
+        pendingWelcome = { ...msg, receivedAt: Date.now() };
+      } else {
+        broadcastCommand({ ...msg, receivedAt: Date.now() });
       }
-
-      broadcast({
-        type:      'sw_command',
-        action,
-        position:  correctedPosition,
-        serverTs,
-        masterTs:  msg.masterTs || 0,
-        audioFile: msg.audioFile || null,
-        receivedAt,
-        clockOffsetMs,
-      });
       break;
     }
 
@@ -222,12 +244,13 @@ self.addEventListener('message', (event) => {
       wsUrl  = msg.wsUrl;
       showId = msg.showId;
       // Reset state for new show
-      offsetHistory = [];
-      rttHistory    = [];
-      clockOffsetMs = 0;
-      rttMs         = 0;
-      burstSent     = 0;
-      burstComplete = false;
+      offsetHistory  = [];
+      rttHistory     = [];
+      clockOffsetMs  = 0;
+      rttMs          = 0;
+      burstSent      = 0;
+      burstComplete  = false;
+      pendingWelcome = null;
       connectWs();
       break;
     }
