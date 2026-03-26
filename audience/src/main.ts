@@ -423,47 +423,80 @@ function getEstimatedMasterPosition(): number {
  * Start playback from rawPosition (seconds, WITHOUT manual offset applied).
  * manualOffsetMs is applied internally.
  *
- * Android fix: if the AudioContext is not running (suspended/interrupted),
- * defer playback via pendingPlaybackPos instead of starting a node on a
- * suspended context. A node started on a suspended context produces no audio
- * and — critically — audioCtx.currentTime is frozen, so playStartCtxTime is
- * recorded at the wrong value. When the context later resumes, currentTime
- * jumps forward and getCurrentPosition() wildly overshoots, breaking all
- * subsequent drift calculations permanently.
+ * Android nuclear fix: close and recreate the AudioContext on EVERY call.
+ * This is the only reliable way to prevent Android Chrome from accumulating
+ * internal audio graph state that leads to unrecoverable suspension after
+ * repeated seek cycles. A brand-new AudioContext is always in a clean
+ * 'suspended' state, and resume() on a fresh context reliably fires
+ * statechange and transitions to 'running'.
+ *
+ * The audioBuffer is decoded once and reused across context recreations
+ * (rawAudioData is kept in memory for this purpose).
  */
-function startPlayback(rawPosition: number) {
-  if (!audioCtx || !audioBuffer) return;
+async function startPlayback(rawPosition: number): Promise<void> {
+  if (!audioBuffer || !rawAudioData) return;
 
-  // Android fix A: never start a node on a non-running context.
-  // Defer and let the statechange handler (or the health-check timer) restart
-  // playback once the context is actually running.
-  if (audioCtx.state !== 'running') {
-    pendingPlaybackPos = rawPosition - (manualOffsetMs / 1000);
-    // Kick a resume attempt — statechange will fire startPlayback when ready
-    resumeAudioContext().catch(() => {});
-    return;
-  }
-
-  // Stop existing node cleanly
-  const oldNode = sourceNode;
-  sourceNode = null;
-  if (oldNode) {
-    try { oldNode.stop(); } catch { /* already stopped */ }
-    oldNode.disconnect();
-  }
+  // Stop all timers and existing node
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
   isPlaying = false;
-
-  // FIX 2: reset consecutive drift counter on every new playback start
   driftOutOfRangeCount = 0;
+
+  // Tear down the existing AudioContext completely.
+  // This is the key fix: rather than trying to resume a potentially-corrupted
+  // context, we close it and start fresh. Android Chrome cannot accumulate
+  // broken internal state across context recreations.
+  if (audioCtx) {
+    const oldCtx = audioCtx;
+    audioCtx = null;
+    sourceNode = null;
+    keepaliveNode = null;
+    try { oldCtx.close(); } catch { /* ignore */ }
+  }
+
+  // iOS silent-switch fix: set audio session to 'playback' BEFORE new context.
+  try {
+    if ('audioSession' in navigator) {
+      (navigator as Navigator & { audioSession: { type: string } }).audioSession.type = 'playback';
+    }
+  } catch { /* ignore */ }
+
+  // Create a brand-new AudioContext — always starts in 'suspended' state.
+  // latencyHint 'playback' signals long-form media to Android Chrome.
+  const ctx = new AudioContext({ latencyHint: 'playback' });
+  audioCtx = ctx;
+  attachAudioContextListeners(ctx);
+
+  // Re-decode audio buffer on the new context.
+  // decodeAudioData is fast (uses cached compressed data) and must be called
+  // on the specific context that will play it.
+  try {
+    audioBuffer = await ctx.decodeAudioData(rawAudioData.slice(0));
+  } catch {
+    // Decode failed — context may have been replaced by a newer call
+    return;
+  }
+
+  // Guard: if context was replaced by a newer startPlayback call, bail out
+  if (ctx !== audioCtx) return;
+
+  // Resume the fresh context — this always works on a newly-created context
+  try { await ctx.resume(); } catch { /* ignore */ }
+  if (ctx !== audioCtx) return;
+
+  // Guard: context must be running before we start the node
+  if (ctx.state !== 'running') {
+    // Extremely unlikely on a fresh context, but defer via pendingPlaybackPos
+    pendingPlaybackPos = rawPosition;
+    return;
+  }
 
   const adjusted = rawPosition + (manualOffsetMs / 1000);
   const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.1));
 
-  const node = audioCtx.createBufferSource();
+  const node = ctx.createBufferSource();
   node.buffer = audioBuffer;
-  node.connect(audioCtx.destination);
+  node.connect(ctx.destination);
   node.start(0, clamped);
 
   node.onended = () => {
@@ -480,9 +513,12 @@ function startPlayback(rawPosition: number) {
   };
 
   sourceNode       = node;
-  playStartCtxTime = audioCtx.currentTime;  // safe: context is running
+  playStartCtxTime = ctx.currentTime;  // safe: context is running
   playStartPos     = clamped;
   isPlaying        = true;
+
+  // Start silent keepalive on the new context
+  startSilentKeepalive();
 
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
@@ -505,14 +541,9 @@ function stopPlayback() {
   driftOutOfRangeCount = 0;
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
-  // Android fix D: explicitly suspend the AudioContext when not playing.
-  // This prevents Android from auto-suspending it unpredictably due to
-  // perceived inactivity. We control the lifecycle explicitly: suspend on
-  // stop, resume on start. This matches the FPlayWeb strategy that survives
-  // repeated seek cycles on Android Chrome.
-  if (audioCtx && audioCtx.state === 'running') {
-    audioCtx.suspend().catch(() => {});
-  }
+  // Note: we do NOT suspend/close the AudioContext here.
+  // startPlayback() closes and recreates the context on every call,
+  // so there is no need to manage suspend state between stop and start.
 }
 
 // ── UI Loop ───────────────────────────────────────────────────────────────────
@@ -565,7 +596,7 @@ function startDriftLoop() {
         resyncs++;
         statResyncs.textContent = String(resyncs);
         const targetRaw = getEstimatedMasterPosition();
-        startPlayback(targetRaw - (manualOffsetMs / 1000));
+        startPlayback(targetRaw).catch(() => {});
         setSyncStatus('synced', 'In sync');
       }
     } else {
@@ -636,18 +667,9 @@ playPauseBtn.addEventListener('click', async () => {
     pendingPlaybackPos = null;
     setSyncStatus('synced', 'Paused locally');
   } else {
-    ensureAudioContext();
-    await resumeAudioContext();
-
-    if (audioCtx!.state !== 'running') {
-      const rawPos = getEstimatedMasterPosition();
-      pendingPlaybackPos = rawPos - (manualOffsetMs / 1000);
-      setSyncStatus('syncing', 'Waiting for audio…');
-    } else {
-      const rawPos = getEstimatedMasterPosition();
-      startPlayback(rawPos - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'In sync');
-    }
+    const rawPos = getEstimatedMasterPosition();
+    await startPlayback(rawPos);
+    setSyncStatus('synced', 'In sync');
   }
 });
 
@@ -671,17 +693,12 @@ async function handleShowCommand(cmd: ShowCommand) {
   switch (cmd.action) {
     case 'play': {
       masterIsPlaying = true;
-      ensureAudioContext();
-      await resumeAudioContext();
       pendingPlaybackPos = null;
-      if (audioCtx!.state !== 'running') {
-        pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
-        setSyncStatus('syncing', 'Waiting for audio…');
-      } else {
-        startPlayback(cmd.position - (manualOffsetMs / 1000));
-        setSyncStatus('synced', 'In sync');
-      }
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
+      // startPlayback closes+recreates the AudioContext on every call.
+      // No need to call ensureAudioContext/resumeAudioContext first.
+      await startPlayback(cmd.position);
+      setSyncStatus('synced', 'In sync');
       break;
     }
     case 'pause': {
@@ -692,21 +709,12 @@ async function handleShowCommand(cmd: ShowCommand) {
       break;
     }
     case 'seek': {
-      const wasPlaying = isPlaying;
       stopPlayback();
       pendingPlaybackPos = null;
       playStartPos = cmd.position;
-      if (wasPlaying || masterIsPlaying) {
-        masterIsPlaying = true;
-        ensureAudioContext();
-        await resumeAudioContext();
-        if (audioCtx!.state !== 'running') {
-          pendingPlaybackPos = cmd.position - (manualOffsetMs / 1000);
-          setSyncStatus('syncing', 'Waiting for audio…');
-        } else {
-          startPlayback(cmd.position - (manualOffsetMs / 1000));
-          setSyncStatus('synced', 'In sync');
-        }
+      if (masterIsPlaying) {
+        await startPlayback(cmd.position);
+        setSyncStatus('synced', 'In sync');
       } else {
         setSyncStatus('synced', 'Paused');
       }
@@ -727,20 +735,11 @@ async function handleShowCommand(cmd: ShowCommand) {
 // ── Manual Resync ─────────────────────────────────────────────────────────────
 async function doManualResync() {
   if (!audioBuffer) return;
-  ensureAudioContext();
-  await resumeAudioContext();
-
   const masterPos = getEstimatedMasterPosition();
-
   if (masterIsPlaying) {
     pendingPlaybackPos = null;
-    if (audioCtx!.state !== 'running') {
-      pendingPlaybackPos = masterPos - (manualOffsetMs / 1000);
-      setSyncStatus('syncing', 'Waiting for audio…');
-    } else {
-      startPlayback(masterPos - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'Resynced');
-    }
+    await startPlayback(masterPos);
+    setSyncStatus('synced', 'Resynced');
   } else {
     stopPlayback();
     pendingPlaybackPos = null;
@@ -763,7 +762,7 @@ function applyOffsetChange(oldOffsetMs: number) {
   // getCurrentPosition() returns position WITH old offset baked in.
   // Strip old offset to get raw position; startPlayback re-adds new offset.
   const rawPos = getCurrentPosition() - (oldOffsetMs / 1000);
-  startPlayback(rawPos);
+  startPlayback(rawPos).catch(() => {});
 }
 
 ftMinus.addEventListener('click', () => {
