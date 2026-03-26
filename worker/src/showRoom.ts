@@ -203,14 +203,24 @@ export class ShowRoom {
       }
 
       case 'resync': {
-        // Audience client requesting fresh authoritative state
-        // Reply with a sync message containing current show state
+        // Audience client requesting fresh authoritative state.
+        // IMPORTANT: showState.position is the position at the moment the last
+        // command was received — it is NOT advanced while playback continues.
+        // When playing, we must compute the current live position by adding the
+        // elapsed time since showState.serverTs, otherwise every resync jumps
+        // all devices back to the same stale point.
+        const now = Date.now();
+        let livePosition = this.showState.position;
+        if (this.showState.isPlaying && this.showState.serverTs > 0) {
+          const elapsedSec = (now - this.showState.serverTs) / 1000;
+          livePosition = this.showState.position + elapsedSec;
+        }
         ws.send(JSON.stringify({
           type:      'sync',
           action:    this.showState.isPlaying ? 'play' : 'pause',
-          position:  this.showState.position,
+          position:  livePosition,
           masterTs:  this.showState.masterTs,
-          serverTs:  Date.now(),
+          serverTs:  now,
           audioFile: this.showState.audioFile,
         }));
         break;
@@ -281,7 +291,11 @@ export class ShowRoom {
     // Persist state so it survives Durable Object hibernation
     await this.state.storage.put('showState', this.showState);
 
-    // Broadcast sync message to all connected audience clients
+    // Broadcast sync message to all connected audience clients.
+    // For play commands the position is already the current live position
+    // (the master just sent it). For pause/seek it is also accurate.
+    // We always broadcast the raw stored position here — transit correction
+    // is applied on the client side using serverTs.
     const syncMsg = JSON.stringify({
       type: 'sync',
       action,

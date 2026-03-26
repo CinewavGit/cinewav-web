@@ -310,6 +310,18 @@ function ensureAudioContext() {
       keepaliveNode = null;
     }
     isPlaying = false;
+
+    // iOS silent-switch fix: set audio session to 'playback' BEFORE creating
+    // the AudioContext. This routes audio through the media channel (same as
+    // YouTube/Spotify) so the ringer/silent switch does NOT mute it.
+    // Supported since iOS 16.4 / Safari 16.4. Safe to call on other platforms
+    // — they either support it or silently ignore it.
+    try {
+      if ('audioSession' in navigator) {
+        (navigator as Navigator & { audioSession: { type: string } }).audioSession.type = 'playback';
+      }
+    } catch { /* ignore — not supported on this platform */ }
+
     audioCtx = new AudioContext();
     attachAudioContextListeners(audioCtx);
   }
