@@ -324,10 +324,15 @@ videoPlayer.addEventListener('pause', () => {
 });
 
 videoPlayer.addEventListener('seeked', () => {
-  if (!isSeeking) {
-    // Seeked programmatically or via native controls
-    broadcastSeek(videoPlayer.currentTime, !videoPlayer.paused);
-  }
+  // Always broadcast after a seek — whether triggered by the seek bar
+  // (isSeeking was true) or programmatically (isSeeking was false).
+  // Clear isSeeking here so the 'pause' event that fires during seeking
+  // is correctly suppressed until the seek completes.
+  isSeeking = false;
+  // Cancel any pending broadcastPlay from the 'play' event that fires
+  // after seek — seeked already sends the correct position.
+  if (broadcastThrottle) { clearTimeout(broadcastThrottle); broadcastThrottle = null; }
+  broadcastSeek(videoPlayer.currentTime, !videoPlayer.paused);
   updateUI();
 });
 
@@ -361,9 +366,12 @@ seekBar.addEventListener('input', () => {
 
 seekBar.addEventListener('change', () => {
   const pos = Number(seekBar.value);
+  // Keep isSeeking = true until the 'seeked' event fires.
+  // If we clear it here, the browser's intermediate 'pause' event
+  // (fired while seeking) will see isSeeking=false and broadcast a
+  // spurious PAUSE that stops all audience devices.
   videoPlayer.currentTime = pos;
-  isSeeking = false;
-  broadcastSeek(pos, !videoPlayer.paused);
+  // broadcastSeek is handled in the 'seeked' handler below.
 });
 
 resyncBtn.addEventListener('click', () => {
