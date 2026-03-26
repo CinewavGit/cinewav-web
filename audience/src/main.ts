@@ -280,18 +280,15 @@ function attachAudioContextListeners(ctx: AudioContext) {
     if (ctx.state === 'running') {
       // Restart silent keepalive on the resumed/new context
       startSilentKeepalive();
-      // Context just became active — restart playback from the current master
-      // position. Always recalculate from master rather than using a stale
-      // pendingPlaybackPos, because the context may have been suspended for
-      // several seconds and the stored position would be wrong.
-      if (masterIsPlaying && audioBuffer) {
-        pendingPlaybackPos = null;
-        const targetRaw = getEstimatedMasterPosition();
-        startPlayback(targetRaw - (manualOffsetMs / 1000));
-        setSyncStatus('synced', 'In sync');
-      } else if (pendingPlaybackPos !== null) {
-        // Not playing per master but we have a deferred position (e.g. manual
-        // play button pressed while context was suspended) — honour it.
+      // Context just resumed — only honour a pendingPlaybackPos that was
+      // explicitly set by a command handler or the play button in THIS session.
+      // Do NOT blindly restart based on masterIsPlaying: that flag may be stale
+      // (e.g. master paused while context was suspended on Android, but the
+      // pause command was missed). Using a stale masterIsPlaying=true here is
+      // the root cause of the ghost-play bug on Android.
+      // The health-check timer and visibility-change handler will request a
+      // fresh resync from the server to get the authoritative current state.
+      if (pendingPlaybackPos !== null) {
         const pos = pendingPlaybackPos;
         pendingPlaybackPos = null;
         startPlayback(pos);
@@ -588,21 +585,23 @@ let healthCheckInterval: ReturnType<typeof setInterval> | null = null;
 function startHealthCheck() {
   if (healthCheckInterval) clearInterval(healthCheckInterval);
   healthCheckInterval = setInterval(async () => {
-    if (!audioCtx || !masterIsPlaying || !audioBuffer) return;
+    if (!audioCtx || !audioBuffer) return;
     if (audioCtx.state === 'running') return; // all good
 
-    // Context is not running while it should be — attempt recovery
+    // Context is not running — attempt recovery.
+    // Do NOT restart playback based on stale masterIsPlaying here: that flag
+    // may be wrong if a pause command was missed while the context was
+    // suspended. Instead, resume the context and request a fresh authoritative
+    // state from the server. The incoming sync command will restart playback
+    // only if the master is actually still playing.
     setSyncStatus('drifted', 'Recovering audio…');
     try {
       await resumeAudioContext();
     } catch { /* ignore */ }
 
-    // If context is now running and we're not playing, restart from master pos
-    if (audioCtx.state === 'running' && !isPlaying) {
-      const targetRaw = getEstimatedMasterPosition();
-      startPlayback(targetRaw - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'In sync');
-    }
+    // Request fresh state from server — this will deliver the correct
+    // play/pause state and position, overriding any stale local flags.
+    sendToSW({ type: 'sw_hard_resync' });
   }, 2000);
 }
 
@@ -866,34 +865,19 @@ document.addEventListener('visibilitychange', async () => {
     await resumeAudioContext();
   }
 
-  // Request immediate ping burst from Service Worker to refresh clock offset
+  // Request fresh authoritative state from the server.
+  // This is the ONLY correct way to recover after coming back to foreground:
+  // the server will reply with the current play/pause state and position,
+  // which will be processed by handleShowCommand and restart playback only
+  // if the master is actually still playing. Do NOT use the stale local
+  // masterIsPlaying flag here — it may be wrong if commands were missed
+  // while the screen was off or the context was suspended.
   sendToSW({ type: 'sw_hard_resync' });
 
-  // If AudioContext is still not running, statechange handler will restart playback
-  if (audioCtx?.state !== 'running') return;
-
-  // Context is running — restart silent keepalive
-  startSilentKeepalive();
-
-  if (masterIsPlaying && audioBuffer) {
-    if (!isPlaying) {
-      // Should be playing but aren't (audio stopped while screen was off)
-      setSyncStatus('drifted', 'Resyncing after background…');
-      const targetRaw = getEstimatedMasterPosition();
-      startPlayback(targetRaw - (manualOffsetMs / 1000));
-      setSyncStatus('synced', 'In sync');
-    } else {
-      // Playing — check drift
-      const actualPos   = getCurrentPosition();
-      const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
-      const drift       = (actualPos - expectedPos) * 1000;
-      if (Math.abs(drift) > 200) {
-        setSyncStatus('drifted', 'Resyncing after background…');
-        const targetRaw = getEstimatedMasterPosition();
-        startPlayback(targetRaw - (manualOffsetMs / 1000));
-        setSyncStatus('synced', 'In sync');
-      }
-    }
+  // If AudioContext is now running, restart the silent keepalive.
+  // Playback will be restarted by the incoming sync command from the server.
+  if (audioCtx?.state === 'running') {
+    startSilentKeepalive();
   }
 });
 
