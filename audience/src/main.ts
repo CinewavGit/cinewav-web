@@ -367,10 +367,11 @@ async function startPlayback(rawPosition: number): Promise<void> {
     return;
   }
   isSeekingInternal = false;
-  // Refresh masterPositionAt to NOW so the drift loop baseline is accurate
-  // from the moment audio actually starts playing (not from when the command
-  // arrived, which could be 50–150ms earlier due to pause+seek+play latency).
-  masterPositionAt = Date.now();
+  // Do NOT reset masterPositionAt here. masterPosition + (Date.now() - masterPositionAt)
+  // is already a running estimate of where the master is. Resetting masterPositionAt
+  // to Date.now() would anchor the clock to masterPosition (the stale command position),
+  // making getEstimatedMasterPosition() return a value seconds behind the master.
+  // The clock is already correct — leave it alone.
   isPlaying = true;
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
