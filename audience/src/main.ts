@@ -108,6 +108,7 @@ let driftMs       = 0;
 let masterIsPlaying  = false;
 let masterPosition   = 0;
 let masterPositionAt = 0;   // Date.now() when masterPosition was last updated
+let isSeekingInternal = false; // true while startPlayback() is mid-seek — suppresses the pause listener
 
 // Pending command received before audio was loaded
 let pendingCommand: ShowCommand | null = null;
@@ -260,10 +261,11 @@ async function initAudio(arrayBuffer: ArrayBuffer): Promise<void> {
     // phone call, Bluetooth disconnect) — track the state change so the
     // visibilitychange handler knows to restart on wake.
     audioEl.addEventListener('pause', () => {
-      // Only update isPlaying if WE didn't initiate the pause via stopPlayback().
-      // stopPlayback() sets isPlaying=false before calling audioEl.pause(), so
-      // by the time this fires isPlaying is already false — this is a no-op.
-      // If the OS paused it externally, isPlaying is still true here — fix it.
+      // Ignore pauses that WE initiated:
+      //  - stopPlayback() sets isPlaying=false before pause() — isPlaying is already false here
+      //  - startPlayback() sets isSeekingInternal=true before pause() — skip this event
+      // Only act on external OS pauses (phone call, screen lock, Bluetooth disconnect).
+      if (isSeekingInternal) return;
       if (isPlaying) {
         isPlaying = false;
         if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
@@ -334,6 +336,8 @@ async function startPlayback(rawPosition: number): Promise<void> {
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
   const adjusted = rawPosition + (manualOffsetMs / 1000);
   const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.05));
+  // Set flag so the 'pause' event listener ignores our internal pause.
+  isSeekingInternal = true;
   // Always pause before seeking. On iOS Safari, setting currentTime while
   // the element is playing fires a seeking event that can cause the subsequent
   // play() call to get an AbortError, silently dropping the command.
@@ -347,6 +351,7 @@ async function startPlayback(rawPosition: number): Promise<void> {
   try {
     await audioEl.play();
   } catch (err: unknown) {
+    isSeekingInternal = false;
     if (err instanceof Error && err.name === 'AbortError') {
       // AbortError: a newer play() call superseded this one — safe to ignore
       return;
@@ -361,6 +366,11 @@ async function startPlayback(rawPosition: number): Promise<void> {
     console.warn('[Audio] play() error:', err);
     return;
   }
+  isSeekingInternal = false;
+  // Refresh masterPositionAt to NOW so the drift loop baseline is accurate
+  // from the moment audio actually starts playing (not from when the command
+  // arrived, which could be 50–150ms earlier due to pause+seek+play latency).
+  masterPositionAt = Date.now();
   isPlaying = true;
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
