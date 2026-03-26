@@ -11,6 +11,8 @@
  *    audience downloads and plays on their devices.
  */
 
+import QRCode from 'qrcode';
+
 // ── DOM Elements ─────────────────────────────────────────────────────────────
 // Audio upload elements
 const audioDropZone       = document.getElementById('audio-drop-zone')!;
@@ -47,6 +49,11 @@ const statLatency       = document.getElementById('stat-latency')!;
 const statState         = document.getElementById('stat-state')!;
 const audienceUrlEl     = document.getElementById('audience-url')!;
 const copyUrlBtn        = document.getElementById('copy-url-btn') as HTMLButtonElement;
+const qrPlaceholder     = document.getElementById('qr-placeholder')!;
+const qrCanvasWrap      = document.getElementById('qr-canvas-wrap')!;
+const qrCanvas          = document.getElementById('qr-canvas') as HTMLCanvasElement;
+const qrDownloadBtn     = document.getElementById('qr-download-btn') as HTMLButtonElement;
+const qrCopyImgBtn      = document.getElementById('qr-copy-img-btn') as HTMLButtonElement;
 const logEl             = document.getElementById('log')!;
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -133,6 +140,7 @@ function connectWebSocket() {
     const audienceUrl = `https://cinewav-audience.pages.dev?show=${showId}&server=${encodeURIComponent(httpBase)}`;
     audienceUrlEl.textContent = audienceUrl;
     copyUrlBtn.disabled = false;
+    generateQR(audienceUrl, showId);
 
     // If video is already loaded, broadcast its state
     if (videoPlayer.readyState >= 1) {
@@ -585,6 +593,48 @@ audioDropZone.addEventListener('drop', (e) => {
     uploadAudioFile(file);
   } else if (file) {
     log('Please drop an audio file (MP3, AAC, WAV, M4A)', 'warn');
+  }
+});
+
+// ── QR Code ───────────────────────────────────────────────────────────────────
+async function generateQR(url: string, showId: string) {
+  try {
+    await QRCode.toCanvas(qrCanvas, url, {
+      width: 200,
+      margin: 1,
+      color: { dark: '#000000', light: '#ffffff' },
+      errorCorrectionLevel: 'M',
+    });
+    qrPlaceholder.style.display = 'none';
+    qrCanvasWrap.classList.add('visible');
+    log('QR code generated', 'success');
+  } catch (err) {
+    log(`QR generation failed: ${err}`, 'warn');
+  }
+}
+
+qrDownloadBtn.addEventListener('click', () => {
+  const url = qrCanvas.toDataURL('image/png');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `cinewav-qr-${(document.getElementById('show-id') as HTMLInputElement).value.trim() || 'show'}.png`;
+  a.click();
+  log('QR code downloaded as PNG', 'success');
+});
+
+qrCopyImgBtn.addEventListener('click', async () => {
+  try {
+    const blob = await new Promise<Blob>((resolve, reject) =>
+      qrCanvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')))
+    );
+    await navigator.clipboard.write([
+      new ClipboardItem({ 'image/png': blob })
+    ]);
+    qrCopyImgBtn.textContent = '✓ Copied!';
+    setTimeout(() => { qrCopyImgBtn.textContent = '⎘ Copy Image'; }, 2000);
+    log('QR code copied to clipboard', 'success');
+  } catch {
+    log('Copy to clipboard not supported in this browser', 'warn');
   }
 });
 
