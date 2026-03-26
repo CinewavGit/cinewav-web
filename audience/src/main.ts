@@ -70,7 +70,6 @@ const statResyncs        = document.getElementById('stat-resyncs')!;
 const statRtt            = document.getElementById('stat-rtt')!;
 const waitingOverlay     = document.getElementById('waiting-overlay')!;
 const errorMsg           = document.getElementById('error-msg')!;
-const silentAudio        = document.getElementById('silent-audio')     as HTMLAudioElement;
 const syncControlsEl     = document.getElementById('sync-controls')!;
 const playPauseBtn       = document.getElementById('play-pause-btn')   as HTMLButtonElement;
 const resyncBtn          = document.getElementById('resync-btn')       as HTMLButtonElement;
@@ -436,19 +435,6 @@ function updateMediaSession() {
       });
     } catch { /* not supported on all browsers */ }
   }
-}
-
-function startSilentAudio() {
-  // The silent audio element is no longer the primary mechanism for keeping
-  // the audio session alive — the main audioEl (Blob URL) does that now.
-  // We keep the silent audio as a belt-and-suspenders fallback for the brief
-  // gap between page load and the first play() call.
-  silentAudio.loop   = true;
-  silentAudio.volume = 0.001;
-  silentAudio.play().catch(() => {});
-  silentAudio.addEventListener('pause', () => {
-    if (audioBlobUrl) silentAudio.play().catch(() => {});
-  }, { once: false });
 }
 
 // ── Play/Pause Button ─────────────────────────────────────────────────────────
@@ -852,7 +838,6 @@ async function joinShow() {
     showScreen('player');
     showIdDisplay.textContent = `Show: ${showId}`;
     setupMediaSession(audioData?.filename || 'Cinewav Show');
-    startSilentAudio();
     syncControlsEl.style.display = 'flex';
     loadManualOffset();
     playPauseBtn.disabled = true;
