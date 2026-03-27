@@ -202,6 +202,14 @@ function handleServerMessage(msg) {
         const welcome = pendingWelcome;
         pendingWelcome = null;
         broadcastCommand(welcome);
+        // After reconnecting and getting a stable clock, immediately request a
+        // fresh resync so the device snaps to the current master position.
+        // This ensures that after a WebSocket disconnect (e.g. DO CPU exhaustion
+        // during rapid seeks), the device recovers automatically without the
+        // user needing to tap Resync.
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resync' }));
+        }
       }
       break;
     }
@@ -275,12 +283,18 @@ self.addEventListener('message', (event) => {
 
     case 'sw_hard_resync': {
       // Main thread requests immediate position — send a ping burst
-      // AND request a fresh sync message from the server
-      startBurst();
+      // AND request a fresh sync message from the server.
+      // If the WebSocket is not open, force an immediate reconnect so the
+      // resync request is not silently dropped. The resync will be sent
+      // automatically after the welcome is flushed (see pong handler above).
       if (ws && ws.readyState === WebSocket.OPEN) {
-        // Send a 'resync' request to the server — it will reply with a 'sync' message
-        // containing the current authoritative state (position, isPlaying)
+        startBurst();
         ws.send(JSON.stringify({ type: 'resync' }));
+      } else {
+        // Socket is closed or closing — cancel any pending reconnect timer
+        // and reconnect immediately so recovery is instant.
+        clearTimeout(reconnectTimer);
+        connectWs();
       }
       break;
     }

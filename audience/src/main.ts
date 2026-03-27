@@ -498,8 +498,8 @@ function stopPlayback() {
   }
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
+  driftOutOfRangeCount = 0; // reset so partial counts don't accumulate across seeks
   isPlaying = false;
-  driftOutOfRangeCount = 0;
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
 }
