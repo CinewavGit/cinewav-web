@@ -81,9 +81,9 @@ let audioCtx:        AudioContext | null          = null;
 let audioBuffer:     AudioBuffer  | null          = null;
 let sourceNode:      AudioBufferSourceNode | null = null;
 let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepalive
-let isPlaying        = false;
-let playStartCtxTime = 0;   // audioCtx.currentTime when playback started
-let playStartPos     = 0;   // audio position (seconds) when playback started
+let isPlaying         = false;
+let playStartWallTime = 0;  // Date.now() when playback started (wall clock, not audio clock)
+let playStartPos      = 0;  // audio position (seconds) when playback started
 let audioDuration    = 0;
 let uiInterval:      ReturnType<typeof setInterval> | null = null;
 let driftInterval:   ReturnType<typeof setInterval> | null = null;
@@ -115,20 +115,12 @@ let rawAudioData: ArrayBuffer | null = null;
 let driftOutOfRangeCount = 0;
 const DRIFT_CONFIRM_COUNT = 2;
 
-// Guard: true while startPlayback() is in the middle of its async
-// close+create+decode+resume sequence. Prevents the drift loop and health-check
-// timer from firing a second concurrent startPlayback() during that window,
-// which would create duplicate drift intervals and corrupt playStartCtxTime.
-let isStartingPlayback = false;
-
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
 // ── Serial Command Queue ──────────────────────────────────────────────────────
-// handleShowCommand is async. If two commands arrive in rapid succession (e.g.
-// seek + play from the master), they must be processed strictly one at a time.
-// Without this, concurrent executions corrupt shared state (sourceNode,
-// isPlaying, masterPositionAt, driftInterval).
+// Commands are processed synchronously one at a time.
+// This prevents rapid seek+play sequences from corrupting shared state.
 let commandQueue: ShowCommand[] = [];
 let commandQueueRunning = false;
 
@@ -172,7 +164,8 @@ function drainCommandQueue() {
   }
   commandQueueRunning = true;
   const cmd = commandQueue.shift()!;
-  handleShowCommand(cmd).then(() => drainCommandQueue()).catch(() => drainCommandQueue());
+  try { handleShowCommand(cmd); } catch { /* ignore */ }
+  drainCommandQueue();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -407,13 +400,15 @@ function startSilentKeepalive() {
 }
 
 /**
- * Returns current playback position in seconds using the Web Audio clock.
- * audioCtx.currentTime is a hardware-backed monotonic timer — immune to
- * browser throttling and system clock adjustments.
+ * Returns current playback position in seconds using the wall clock.
+ * Uses Date.now() instead of audioCtx.currentTime because audioCtx.currentTime
+ * freezes when the AudioContext is suspended on Android, causing drift
+ * calculations to go wildly wrong. Date.now() always advances regardless of
+ * AudioContext state, making position tracking robust on Android Chrome.
  */
 function getCurrentPosition(): number {
-  if (!audioCtx || !isPlaying) return playStartPos;
-  return playStartPos + (audioCtx.currentTime - playStartCtxTime);
+  if (!isPlaying) return playStartPos;
+  return playStartPos + (Date.now() - playStartWallTime) / 1000;
 }
 
 /**
@@ -429,94 +424,42 @@ function getEstimatedMasterPosition(): number {
  * Start playback from rawPosition (seconds, WITHOUT manual offset applied).
  * manualOffsetMs is applied internally.
  *
- * Android nuclear fix: close and recreate the AudioContext on EVERY call.
- * This is the only reliable way to prevent Android Chrome from accumulating
- * internal audio graph state that leads to unrecoverable suspension after
- * repeated seek cycles. A brand-new AudioContext is always in a clean
- * 'suspended' state, and resume() on a fresh context reliably fires
- * statechange and transitions to 'running'.
+ * Synchronous — no async/await. Stops the existing node, creates a new one,
+ * and records playStartWallTime = Date.now() for position tracking.
  *
- * The audioBuffer is decoded once and reused across context recreations
- * (rawAudioData is kept in memory for this purpose).
+ * Position tracking uses Date.now() (wall clock) rather than
+ * audioCtx.currentTime. This is critical for Android: audioCtx.currentTime
+ * freezes when the context is suspended, causing drift calculations to
+ * wildly overshoot. Date.now() always advances regardless of context state.
+ *
+ * The AudioContext is kept alive permanently. No close/recreate on seek.
+ * If the context is not running when this is called, we start the node
+ * anyway (it will produce audio once the context resumes) and record
+ * playStartWallTime so position tracking is correct from the moment
+ * the context actually starts playing.
  */
-async function startPlayback(rawPosition: number): Promise<void> {
-  if (!audioBuffer || !rawAudioData) return;
-
-  // Prevent concurrent calls: if a startPlayback is already in flight (async
-  // decode+resume), ignore this call. The in-flight call will start playback
-  // at the most recently requested position via the command queue serialisation.
-  if (isStartingPlayback) return;
-  isStartingPlayback = true;
+function startPlayback(rawPosition: number): void {
+  if (!audioCtx || !audioBuffer) return;
 
   // Stop all timers and existing node
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
-  isPlaying = false;
   driftOutOfRangeCount = 0;
 
-  // Tear down the existing AudioContext completely.
-  // This is the key fix: rather than trying to resume a potentially-corrupted
-  // context, we close it and start fresh. Android Chrome cannot accumulate
-  // broken internal state across context recreations.
-  if (audioCtx) {
-    const oldCtx = audioCtx;
-    audioCtx = null;
-    sourceNode = null;
-    keepaliveNode = null;
-    try { oldCtx.close(); } catch { /* ignore */ }
-  }
-
-  // iOS silent-switch fix: set audio session to 'playback' BEFORE new context.
-  try {
-    if ('audioSession' in navigator) {
-      (navigator as Navigator & { audioSession: { type: string } }).audioSession.type = 'playback';
-    }
-  } catch { /* ignore */ }
-
-  // Create a brand-new AudioContext — always starts in 'suspended' state.
-  // latencyHint 'playback' signals long-form media to Android Chrome.
-  const ctx = new AudioContext({ latencyHint: 'playback' });
-  audioCtx = ctx;
-  attachAudioContextListeners(ctx);
-
-  // Re-decode audio buffer on the new context.
-  // decodeAudioData is fast (uses cached compressed data) and must be called
-  // on the specific context that will play it.
-  try {
-    audioBuffer = await ctx.decodeAudioData(rawAudioData.slice(0));
-  } catch {
-    // Decode failed — context may have been replaced by a newer call
-    isStartingPlayback = false;
-    return;
-  }
-
-  // Guard: if context was replaced by a newer startPlayback call, bail out
-  if (ctx !== audioCtx) {
-    isStartingPlayback = false;
-    return;
-  }
-
-  // Resume the fresh context — this always works on a newly-created context
-  try { await ctx.resume(); } catch { /* ignore */ }
-  if (ctx !== audioCtx) {
-    isStartingPlayback = false;
-    return;
-  }
-
-  // Guard: context must be running before we start the node
-  if (ctx.state !== 'running') {
-    // Extremely unlikely on a fresh context, but defer via pendingPlaybackPos
-    pendingPlaybackPos = rawPosition;
-    isStartingPlayback = false;
-    return;
+  const oldNode = sourceNode;
+  sourceNode = null;
+  isPlaying  = false;
+  if (oldNode) {
+    try { oldNode.stop(); } catch { /* already stopped */ }
+    oldNode.disconnect();
   }
 
   const adjusted = rawPosition + (manualOffsetMs / 1000);
   const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.1));
 
-  const node = ctx.createBufferSource();
+  const node = audioCtx.createBufferSource();
   node.buffer = audioBuffer;
-  node.connect(ctx.destination);
+  node.connect(audioCtx.destination);
   node.start(0, clamped);
 
   node.onended = () => {
@@ -532,18 +475,12 @@ async function startPlayback(rawPosition: number): Promise<void> {
     }
   };
 
-  sourceNode       = node;
-  playStartCtxTime = ctx.currentTime;  // safe: context is running
-  playStartPos     = clamped;
-  isPlaying        = true;
+  sourceNode        = node;
+  playStartWallTime = Date.now();  // wall clock — immune to AudioContext suspension
+  playStartPos      = clamped;
+  isPlaying         = true;
 
-  // Clear the in-flight guard BEFORE starting the drift loop so that
-  // future auto-resyncs from the drift loop are not blocked.
-  isStartingPlayback = false;
-
-  // Start silent keepalive on the new context
   startSilentKeepalive();
-
   albumArt.classList.add('playing');
   waitingOverlay.classList.add('hidden');
   updatePlayPauseBtn();
@@ -553,11 +490,6 @@ async function startPlayback(rawPosition: number): Promise<void> {
 }
 
 function stopPlayback() {
-  // If a startPlayback() is in flight, cancel it by clearing the context
-  // reference. The in-flight call will see ctx !== audioCtx and bail out.
-  // Also reset the guard so the next startPlayback() call is not blocked.
-  isStartingPlayback = false;
-
   const node = sourceNode;
   sourceNode = null;
   if (node) {
@@ -570,9 +502,6 @@ function stopPlayback() {
   driftOutOfRangeCount = 0;
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
-  // Note: we do NOT suspend/close the AudioContext here.
-  // startPlayback() closes and recreates the context on every call,
-  // so there is no need to manage suspend state between stop and start.
 }
 
 // ── UI Loop ───────────────────────────────────────────────────────────────────
@@ -597,16 +526,6 @@ function startDriftLoop() {
   driftInterval = setInterval(() => {
     if (!isPlaying || !masterIsPlaying) return;
 
-    // Android fix B: if the AudioContext is not running, the Web Audio clock
-    // (audioCtx.currentTime) is frozen. getCurrentPosition() will return a
-    // stale value and all drift calculations will be wrong. Skip this tick
-    // and kick a resume attempt instead. The statechange handler (or the
-    // health-check timer) will restart playback when the context recovers.
-    if (!audioCtx || audioCtx.state !== 'running') {
-      resumeAudioContext().catch(() => {});
-      return;
-    }
-
     const actualPos   = getCurrentPosition();
     const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
     driftMs = (actualPos - expectedPos) * 1000;
@@ -620,12 +539,12 @@ function startDriftLoop() {
     // FIX 2: require 2 consecutive out-of-range readings before auto-resync
     if (driftMs > RESYNC_AHEAD_MS || driftMs < -RESYNC_BEHIND_MS) {
       driftOutOfRangeCount++;
-      if (driftOutOfRangeCount >= DRIFT_CONFIRM_COUNT && !isStartingPlayback) {
+      if (driftOutOfRangeCount >= DRIFT_CONFIRM_COUNT) {
         driftOutOfRangeCount = 0;
         resyncs++;
         statResyncs.textContent = String(resyncs);
         const targetRaw = getEstimatedMasterPosition();
-        startPlayback(targetRaw).catch(() => {});
+        startPlayback(targetRaw);
         setSyncStatus('synced', 'In sync');
       }
     } else {
@@ -688,7 +607,7 @@ function updatePlayPauseBtn() {
   playPauseBtn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
 }
 
-playPauseBtn.addEventListener('click', async () => {
+playPauseBtn.addEventListener('click', () => {
   if (!audioBuffer) return;
 
   if (isPlaying) {
@@ -696,37 +615,34 @@ playPauseBtn.addEventListener('click', async () => {
     pendingPlaybackPos = null;
     setSyncStatus('synced', 'Paused locally');
   } else {
+    ensureAudioContext();
+    resumeAudioContext().catch(() => {});
     const rawPos = getEstimatedMasterPosition();
-    await startPlayback(rawPos);
+    startPlayback(rawPos);
     setSyncStatus('synced', 'In sync');
   }
 });
 
-// ── Show Command Handler ──────────────────────────────────────────────────────
-async function handleShowCommand(cmd: ShowCommand) {
+// ── Show Command Handler ─────────────────────────────────────────────────────────────
+function handleShowCommand(cmd: ShowCommand) {
   if (!audioBuffer) {
     pendingCommand = cmd;
     return;
   }
 
   // FIX 1: use cmd.enqueuedAt (stamped on main thread when command entered
-  // the queue) rather than Date.now() here. By the time handleShowCommand
-  // runs, the command may have waited in the queue for 50–300ms while a
-  // previous command's await completed. Using enqueuedAt means
-  // masterPositionAt reflects when the command actually arrived, so
-  // getEstimatedMasterPosition() correctly advances position by the elapsed
-  // time since then.
+  // the queue) rather than Date.now() here.
   masterPosition   = cmd.position;
-  masterPositionAt = cmd.enqueuedAt ?? Date.now(); // FIX 1
+  masterPositionAt = cmd.enqueuedAt ?? Date.now();
 
   switch (cmd.action) {
     case 'play': {
       masterIsPlaying = true;
       pendingPlaybackPos = null;
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
-      // startPlayback closes+recreates the AudioContext on every call.
-      // No need to call ensureAudioContext/resumeAudioContext first.
-      await startPlayback(cmd.position);
+      ensureAudioContext();
+      resumeAudioContext().catch(() => {});
+      startPlayback(cmd.position);
       setSyncStatus('synced', 'In sync');
       break;
     }
@@ -742,7 +658,9 @@ async function handleShowCommand(cmd: ShowCommand) {
       pendingPlaybackPos = null;
       playStartPos = cmd.position;
       if (masterIsPlaying) {
-        await startPlayback(cmd.position);
+        ensureAudioContext();
+        resumeAudioContext().catch(() => {});
+        startPlayback(cmd.position);
         setSyncStatus('synced', 'In sync');
       } else {
         setSyncStatus('synced', 'Paused');
@@ -762,12 +680,14 @@ async function handleShowCommand(cmd: ShowCommand) {
 }
 
 // ── Manual Resync ─────────────────────────────────────────────────────────────
-async function doManualResync() {
+function doManualResync() {
   if (!audioBuffer) return;
   const masterPos = getEstimatedMasterPosition();
   if (masterIsPlaying) {
     pendingPlaybackPos = null;
-    await startPlayback(masterPos);
+    ensureAudioContext();
+    resumeAudioContext().catch(() => {});
+    startPlayback(masterPos);
     setSyncStatus('synced', 'Resynced');
   } else {
     stopPlayback();
@@ -779,10 +699,9 @@ async function doManualResync() {
 
 resyncBtn.addEventListener('click', () => {
   sendToSW({ type: 'sw_hard_resync' });
-  doManualResync().then(() => {
-    resyncBtn.textContent = '✓ Synced!';
-    setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
-  });
+  doManualResync();
+  resyncBtn.textContent = '✓ Synced!';
+  setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
 });
 
 // ── Fine-Tune Offset Controls ─────────────────────────────────────────────────
@@ -791,7 +710,7 @@ function applyOffsetChange(oldOffsetMs: number) {
   // getCurrentPosition() returns position WITH old offset baked in.
   // Strip old offset to get raw position; startPlayback re-adds new offset.
   const rawPos = getCurrentPosition() - (oldOffsetMs / 1000);
-  startPlayback(rawPos).catch(() => {});
+  startPlayback(rawPos);
 }
 
 ftMinus.addEventListener('click', () => {
