@@ -44,6 +44,7 @@ interface ConnectedClient {
 export class ShowRoom {
   private state: DurableObjectState;
   private clients: Map<string, ConnectedClient> = new Map();
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private showState: ShowState = {
     isPlaying: false,
     position: 0,
@@ -288,8 +289,20 @@ export class ShowRoom {
       // Note: audioHash and audioReady are set separately via /audio-ready
     }
 
-    // Persist state so it survives Durable Object hibernation
-    await this.state.storage.put('showState', this.showState);
+    // Persist state so it survives Durable Object hibernation.
+    // For play/pause, persist immediately — these are critical state transitions.
+    // For seek, debounce to at most one write per second to avoid exhausting the
+    // Durable Object CPU budget during rapid seeks (which would kill the WebSocket).
+    if (action === 'play' || action === 'pause' || action === 'load') {
+      await this.state.storage.put('showState', this.showState);
+    } else {
+      // seek — debounced write
+      if (this.persistTimer !== null) clearTimeout(this.persistTimer);
+      this.persistTimer = setTimeout(() => {
+        this.persistTimer = null;
+        this.state.storage.put('showState', this.showState).catch(() => {});
+      }, 1000);
+    }
 
     // Broadcast sync message to all connected audience clients.
     // For play commands the position is already the current live position
