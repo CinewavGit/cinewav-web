@@ -112,6 +112,7 @@ function connectWs() {
       clientId: `sw-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     }));
     startBurst();
+    startHeartbeat();  // keep WS alive through Android NAT timeouts and idle detection
     broadcast({ type: 'sw_connected' });
   };
 
@@ -267,6 +268,7 @@ self.addEventListener('message', (event) => {
       clearTimeout(reconnectTimer);
       clearTimeout(pingTimer);
       clearInterval(pingTimer);
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
       if (ws) {
         ws.onclose = null;
         ws.close();
@@ -301,10 +303,49 @@ self.addEventListener('message', (event) => {
   }
 });
 
+// ── Keep-Alive Web Lock ──────────────────────────────────────────────────────
+// Android Chrome aggressively terminates Service Workers that have no active
+// fetch events and no held Web Locks. When the SW is killed, its WebSocket
+// dies silently — no onclose fires, so the main thread never gets a
+// sw_disconnected message and the device plays independently with no recovery.
+//
+// Holding a Web Lock with an infinite promise keeps the SW alive for the
+// duration of the lock. The lock is re-acquired on activate so it survives
+// SW updates. This is the standard pattern for keeping a SW alive on Android.
+function acquireKeepAliveLock() {
+  if (!('locks' in navigator)) return;
+  navigator.locks.request('cinewav-sw-keepalive', { mode: 'exclusive' }, () => {
+    // Return a promise that never resolves — holds the lock indefinitely.
+    return new Promise(() => {});
+  });
+}
+
+// ── WebSocket Heartbeat ───────────────────────────────────────────────────────
+// Send a ping every 20 seconds to keep the WebSocket connection alive through
+// Android's aggressive network idle detection and NAT timeout (typically 30s).
+// The DO already responds to pings with pongs which update the clock offset.
+// This is separate from the keepalive interval — it fires even during the
+// initial burst phase to prevent the connection from being torn down.
+let heartbeatTimer = null;
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping', clientTs: Date.now() }));
+    } else if (wsUrl) {
+      // WebSocket died silently — reconnect immediately
+      clearTimeout(reconnectTimer);
+      connectWs();
+    }
+  }, 20000);
+}
+
 // ── Install / Activate ────────────────────────────────────────────────────────
 self.addEventListener('install',  () => self.skipWaiting());
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    self.clients.claim().then(() => acquireKeepAliveLock())
+  );
 });
 
 // ── Fetch handler (pass-through — Vite PWA handles caching) ──────────────────
