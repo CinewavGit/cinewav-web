@@ -122,7 +122,7 @@ export class ShowRoom {
     // ── REST: POST /command (master only, fallback for non-WS clients) ─────
     if (subPath === '/command' && request.method === 'POST') {
       const body = await request.json<{ action: string; position: number; masterTs: number; audioFile?: string }>();
-      await this.applyCommand(body.action, body.position, body.masterTs, body.audioFile);
+      this.applyCommand(body.action, body.position, body.masterTs, body.audioFile);
       return new Response(JSON.stringify({ ok: true }), {
         headers: { 'Content-Type': 'application/json' },
       });

@@ -486,17 +486,20 @@ function startPlayback(rawPosition: number): void {
     if (measuredLatency > 0) platformLatencyMs = measuredLatency;
   }
 
-  // Advance the seek position by the platform output latency so that the audio
-  // reaching the speakers aligns with the master timeline. On Android with
-  // latencyHint:'playback', the OS buffers ~300ms before output, so we start
-  // the node 300ms ahead in the file to compensate. On iOS platformLatencyMs≈0.
-  const adjusted = rawPosition + (manualOffsetMs / 1000) + (platformLatencyMs / 1000);
-  const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.1));
+  // playStartPos tracks position in MASTER-space (no platformLatencyMs).
+  // This keeps getCurrentPosition() in the same coordinate space as
+  // getEstimatedMasterPosition() so the drift loop compares apples to apples.
+  // platformLatencyMs is ONLY applied to the node.start() offset so the audio
+  // hardware output aligns with the master timeline despite the OS buffer delay.
+  const masterSpacePos = rawPosition + (manualOffsetMs / 1000);
+  const nodeStartPos   = masterSpacePos + (platformLatencyMs / 1000);
+  const clamped        = Math.max(0, Math.min(nodeStartPos, audioDuration - 0.1));
+  const clampedMaster  = Math.max(0, Math.min(masterSpacePos, audioDuration - 0.1));
 
   const node = audioCtx.createBufferSource();
   node.buffer = audioBuffer;
   node.connect(audioCtx.destination);
-  node.start(0, clamped);
+  node.start(0, clamped);  // starts ahead in file by platformLatencyMs
 
   node.onended = () => {
     if (sourceNode === node) {
@@ -513,7 +516,7 @@ function startPlayback(rawPosition: number): void {
 
   sourceNode        = node;
   playStartWallTime = Date.now();  // wall clock — immune to AudioContext suspension
-  playStartPos      = clamped;
+  playStartPos      = clampedMaster;  // master-space: no platformLatencyMs
   isPlaying         = true;
 
   startSilentKeepalive();

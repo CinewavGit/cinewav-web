@@ -56,7 +56,7 @@ const qrDownloadBtn     = document.getElementById('qr-download-btn') as HTMLButt
 const qrCopyImgBtn      = document.getElementById('qr-copy-img-btn') as HTMLButtonElement;
 const logEl             = document.getElementById('log')!;
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────────────────
 let ws: WebSocket | null = null;
 let serverLatencyMs = 0;
 let pingInterval: ReturnType<typeof setInterval> | null = null;
@@ -66,6 +66,7 @@ let currentWorkerBase = '';
 let isSeeking = false;
 let videoObjectUrl = '';
 let broadcastThrottle: ReturnType<typeof setTimeout> | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 function log(msg: string, level: 'info' | 'success' | 'warn' | 'error' = 'info') {
@@ -118,7 +119,17 @@ function connectWebSocket() {
   currentWorkerBase = workerBase.replace(/^http/, 'ws').replace(/\/$/, '');
   const wsUrl = `${currentWorkerBase}/api/show/${showId}/ws`;
 
-  if (ws) { ws.close(); ws = null; }
+  // Detach handlers before closing so the old socket's onclose doesn't
+  // schedule a second auto-reconnect on top of the one already in progress.
+  if (ws) {
+    ws.onopen    = null;
+    ws.onmessage = null;
+    ws.onerror   = null;
+    ws.onclose   = null;
+    ws.close();
+    ws = null;
+  }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
   setWsStatus('connecting');
   log(`Connecting to ${wsUrl}…`);
@@ -164,13 +175,13 @@ function connectWebSocket() {
     connectBtn.disabled = false;
     stopPingLoop();
     // Auto-reconnect so a DO crash during rapid seeks doesn't leave the
-    // master permanently offline. Audience devices reconnect automatically;
-    // the master must do the same so it can resume broadcasting.
-    setTimeout(() => {
-      if (ws === null || ws.readyState === WebSocket.CLOSED) {
-        log('Auto-reconnecting…', 'info');
-        connectWebSocket();
-      }
+    // master permanently offline. Guard with reconnectTimer so only one
+    // reconnect attempt is ever scheduled at a time.
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      log('Auto-reconnecting…', 'info');
+      connectWebSocket();
     }, 3000);
   };
 
