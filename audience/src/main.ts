@@ -111,6 +111,12 @@ let pendingPlaybackPos: number | null = null;
 // Raw audio ArrayBuffer kept in memory so we can re-decode if AudioContext is closed
 let rawAudioData: ArrayBuffer | null = null;
 
+// Platform output latency in ms (non-zero on Android with latencyHint:'playback').
+// Measured from audioCtx.outputLatency + audioCtx.baseLatency after context creation.
+// Subtracted from the wall-clock position in startPlayback to compensate for
+// the OS audio buffer delay so audio aligns with the master timeline.
+let platformLatencyMs = 0;
+
 // FIX 2: consecutive out-of-range drift readings required before auto-resync
 let driftOutOfRangeCount = 0;
 const DRIFT_CONFIRM_COUNT = 2;
@@ -332,6 +338,19 @@ function ensureAudioContext() {
     // Web Audio player that reliably survives Android screen-off + seek cycles.
     audioCtx = new AudioContext({ latencyHint: 'playback' });
     attachAudioContextListeners(audioCtx);
+
+    // Measure the total output latency introduced by the OS audio stack.
+    // On Android with latencyHint:'playback', Chrome requests a large buffer
+    // (~300ms) which causes audio to play late relative to the wall clock.
+    // outputLatency = time from when audio is submitted to when it reaches speakers.
+    // baseLatency   = time for a single render quantum to be processed.
+    // We store this and subtract it from the seek offset in startPlayback so
+    // the audio aligns with the master timeline despite the buffering delay.
+    // iOS does not use latencyHint:'playback' (it uses audioSession.type instead)
+    // so outputLatency is near-zero there and this correction is a no-op.
+    platformLatencyMs = Math.round(
+      ((audioCtx.outputLatency ?? 0) + (audioCtx.baseLatency ?? 0)) * 1000
+    );
   }
 }
 
@@ -454,7 +473,11 @@ function startPlayback(rawPosition: number): void {
     oldNode.disconnect();
   }
 
-  const adjusted = rawPosition + (manualOffsetMs / 1000);
+  // Advance the seek position by the platform output latency so that the audio
+  // reaching the speakers aligns with the master timeline. On Android with
+  // latencyHint:'playback', the OS buffers ~300ms before output, so we start
+  // the node 300ms ahead in the file to compensate. On iOS platformLatencyMs≈0.
+  const adjusted = rawPosition + (manualOffsetMs / 1000) + (platformLatencyMs / 1000);
   const clamped  = Math.max(0, Math.min(adjusted, audioDuration - 0.1));
 
   const node = audioCtx.createBufferSource();
