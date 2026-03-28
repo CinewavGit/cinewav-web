@@ -773,11 +773,11 @@ ftReset.addEventListener('click', () => {
   applyOffsetChange(old);
 });
 
-// ── Service Worker Message Handler ───────────────────────────────────────────
+// ── Service Worker Message Handler ──────────────────────────────────────────────────────
 function handleSWMessage(event: MessageEvent) {
-  const msg = event.data;
-  if (!msg) return;
-
+  const msg = event.data as SWMessage;
+  if (!msg?.type) return;
+  resetSWWatchdog(); // any message from SW means it's alive
   switch (msg.type) {
     case 'sw_connected':
       setSyncStatus('syncing', 'Syncing clock…');
@@ -868,6 +868,36 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 // ── Service Worker Setup ──────────────────────────────────────────────────────
+
+// Main-thread watchdog: if the SW goes silent for >25 seconds while we are
+// supposed to be connected, force a hard resync. This catches the case where
+// Android Chrome kills the SW process silently (no sw_disconnected message).
+let lastSWMessageAt = 0;
+let swWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+function resetSWWatchdog() {
+  lastSWMessageAt = Date.now();
+}
+
+function startSWWatchdog(wsUrl: string) {
+  if (swWatchdogTimer) clearInterval(swWatchdogTimer);
+  lastSWMessageAt = Date.now();
+  swWatchdogTimer = setInterval(() => {
+    const silentMs = Date.now() - lastSWMessageAt;
+    if (silentMs > 25000) {
+      // SW has been silent for >25s — it was likely killed by Android.
+      // Force an immediate reconnect: re-register the SW and reinitialise.
+      console.warn('[Watchdog] SW silent for', silentMs, 'ms — forcing reconnect');
+      lastSWMessageAt = Date.now(); // reset so we don't fire again immediately
+      sendToSW({ type: 'sw_hard_resync' });
+      // If SW is truly dead, re-register it
+      if (!navigator.serviceWorker.controller) {
+        registerSyncWorker(wsUrl).catch(() => {});
+      }
+    }
+  }, 5000);
+}
+
 async function registerSyncWorker(wsUrl: string): Promise<void> {
   if (!('serviceWorker' in navigator)) {
     console.warn('SW not supported — using direct WebSocket');
@@ -880,7 +910,16 @@ async function registerSyncWorker(wsUrl: string): Promise<void> {
   const initSW = (sw: ServiceWorker) => {
     syncSW = sw;
     sw.postMessage({ type: 'sw_init', wsUrl, showId });
+    startSWWatchdog(wsUrl);
   };
+
+  // Force update check so the new SW (with keep-alive lock) activates immediately
+  // instead of waiting for all tabs to close. skipWaiting() in the SW handles
+  // the install side; update() + clients.claim() handles the activate side.
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) await reg.update();
+  } catch { /* ignore — update is best-effort */ }
 
   if (navigator.serviceWorker.controller) {
     initSW(navigator.serviceWorker.controller);
