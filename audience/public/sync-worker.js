@@ -343,8 +343,17 @@ function startHeartbeat() {
 // ── Install / Activate ────────────────────────────────────────────────────────
 self.addEventListener('install',  () => self.skipWaiting());
 self.addEventListener('activate', (event) => {
+  // Pass a never-resolving promise directly to waitUntil.
+  // This is the correct pattern: the SW's activate event never "completes",
+  // so Android Chrome cannot mark the SW as idle and terminate it.
+  // The Web Lock is a belt-and-suspenders backup; the waitUntil is the primary.
   event.waitUntil(
-    self.clients.claim().then(() => acquireKeepAliveLock())
+    self.clients.claim().then(() => {
+      acquireKeepAliveLock();
+      // Return a promise that never resolves — keeps the activate event
+      // permanently pending, preventing Android from garbage-collecting the SW.
+      return new Promise(() => {});
+    })
   );
 });
 

@@ -234,7 +234,7 @@ function parseUrlParams() {
 function sendToSW(msg: object) {
   if (syncSW) {
     syncSW.postMessage(msg);
-  } else if (navigator.serviceWorker.controller) {
+  } else if (navigator.serviceWorker?.controller) {
     navigator.serviceWorker.controller.postMessage(msg);
   }
 }
