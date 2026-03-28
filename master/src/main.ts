@@ -160,9 +160,18 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     setWsStatus('disconnected');
-    log('WebSocket disconnected', 'warn');
+    log('WebSocket disconnected — reconnecting in 3s…', 'warn');
     connectBtn.disabled = false;
     stopPingLoop();
+    // Auto-reconnect so a DO crash during rapid seeks doesn't leave the
+    // master permanently offline. Audience devices reconnect automatically;
+    // the master must do the same so it can resume broadcasting.
+    setTimeout(() => {
+      if (ws === null || ws.readyState === WebSocket.CLOSED) {
+        log('Auto-reconnecting…', 'info');
+        connectWebSocket();
+      }
+    }, 3000);
   };
 
   ws.onerror = () => {

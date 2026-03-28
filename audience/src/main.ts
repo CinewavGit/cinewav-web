@@ -348,9 +348,9 @@ function ensureAudioContext() {
     // the audio aligns with the master timeline despite the buffering delay.
     // iOS does not use latencyHint:'playback' (it uses audioSession.type instead)
     // so outputLatency is near-zero there and this correction is a no-op.
-    platformLatencyMs = Math.round(
-      ((audioCtx.outputLatency ?? 0) + (audioCtx.baseLatency ?? 0)) * 1000
-    );
+    // NOTE: outputLatency is NOT read here — it returns 0 while the context is
+    // still suspended (i.e. immediately after creation). It is read inside
+    // startPlayback() after the context has been resumed and is running.
   }
 }
 
@@ -471,6 +471,19 @@ function startPlayback(rawPosition: number): void {
   if (oldNode) {
     try { oldNode.stop(); } catch { /* already stopped */ }
     oldNode.disconnect();
+  }
+
+  // Read outputLatency NOW (not at context creation) — it is only populated
+  // after the context is running and has processed its first audio frame.
+  // Reading it at new AudioContext() always returns 0 (context still suspended).
+  // On Android with latencyHint:'playback' this is typically 200–350ms.
+  // On iOS it is near-zero. We cache it so rapid seeks don't re-read constantly.
+  if (audioCtx.state === 'running') {
+    const measuredLatency = Math.round(
+      ((audioCtx.outputLatency ?? 0) + (audioCtx.baseLatency ?? 0)) * 1000
+    );
+    // Only update if we got a non-zero reading (zero means not yet populated)
+    if (measuredLatency > 0) platformLatencyMs = measuredLatency;
   }
 
   // Advance the seek position by the platform output latency so that the audio

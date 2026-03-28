@@ -199,7 +199,7 @@ export class ShowRoom {
         const position = (msg.position as number) || 0;
         const masterTs = (msg.masterTs as number) || Date.now();
         const audioFile = msg.audioFile as string | undefined;
-        await this.applyCommand(action, position, masterTs, audioFile);
+        this.applyCommand(action, position, masterTs, audioFile);
         break;
       }
 
@@ -258,12 +258,12 @@ export class ShowRoom {
 
   // ── Private Helpers ─────────────────────────────────────────────────────────
 
-  private async applyCommand(
+  private applyCommand(
     action: string,
     position: number,
     masterTs: number,
     audioFile?: string
-  ): Promise<void> {
+  ): void {
     const serverTs = Date.now();
 
     if (action === 'play') {
@@ -290,11 +290,13 @@ export class ShowRoom {
     }
 
     // Persist state so it survives Durable Object hibernation.
-    // For play/pause, persist immediately — these are critical state transitions.
-    // For seek, debounce to at most one write per second to avoid exhausting the
-    // Durable Object CPU budget during rapid seeks (which would kill the WebSocket).
+    // ALL writes are fire-and-forget (never awaited) so a slow or failing
+    // storage write can NEVER block the WebSocket message handler or exhaust
+    // the DO CPU budget. The DO crashing mid-seek was caused by awaiting
+    // storage.put() under rapid seek load.
+    // Seek writes are debounced to 1s to avoid write amplification.
     if (action === 'play' || action === 'pause' || action === 'load') {
-      await this.state.storage.put('showState', this.showState);
+      this.state.storage.put('showState', this.showState).catch(() => {});
     } else {
       // seek — debounced write
       if (this.persistTimer !== null) clearTimeout(this.persistTimer);
