@@ -458,6 +458,9 @@ function getEstimatedMasterPosition(): number {
  * the context actually starts playing.
  */
 function startPlayback(rawPosition: number): void {
+  // Stop post-show polling — playback is resuming.
+  stopPostShowPolling();
+
   if (!audioCtx || !audioBuffer) return;
 
   // Stop all timers and existing node
@@ -511,6 +514,18 @@ function startPlayback(rawPosition: number): void {
       driftOutOfRangeCount = 0;
       updatePlayPauseBtn();
       if (!masterIsPlaying) setSyncStatus('synced', 'Show ended');
+
+      // Keep the AudioContext and Service Worker alive after the track ends.
+      // On Android, when the last AudioBufferSourceNode stops, Chrome detects
+      // the audio session as ended and suspends the AudioContext. Once suspended
+      // with no drift loop running, Android terminates the SW within 30 seconds.
+      //
+      // Fix: restart the silent keepalive node (keeps the audio session alive)
+      // and start a lightweight post-show polling loop that sends a server
+      // resync every 20 seconds. This keeps the SW active and ensures the device
+      // snaps back into sync immediately when the master player seeks or replays.
+      startSilentKeepalive();
+      startPostShowPolling();
     }
   };
 
@@ -621,6 +636,30 @@ function startHealthCheck() {
     // play/pause state and position, overriding any stale local flags.
     sendToSW({ type: 'sw_hard_resync' });
   }, 2000);
+}
+
+// ── Post-Show Polling ────────────────────────────────────────────────────────
+// After the track ends naturally, keep the SW and AudioContext alive by
+// polling the server for state every 20 seconds. This ensures the device
+// immediately re-syncs when the master player seeks back or restarts the show,
+// even hours later. The poll is stopped as soon as playback resumes.
+let postShowPollInterval: ReturnType<typeof setInterval> | null = null;
+
+function startPostShowPolling() {
+  if (postShowPollInterval) return; // already running
+  postShowPollInterval = setInterval(() => {
+    // Keep the SW alive by sending a message to it every 20s.
+    // Also request a fresh server state so we snap back immediately
+    // if the master restarts the show.
+    sendToSW({ type: 'sw_hard_resync' });
+  }, 20000);
+}
+
+function stopPostShowPolling() {
+  if (postShowPollInterval) {
+    clearInterval(postShowPollInterval);
+    postShowPollInterval = null;
+  }
 }
 
 // ── Media Session ─────────────────────────────────────────────────────────────
