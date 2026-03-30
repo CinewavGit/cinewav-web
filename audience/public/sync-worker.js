@@ -353,19 +353,23 @@ function startHeartbeat() {
   }, 20000);
 }
 
-// ── Install / Activate ────────────────────────────────────────────────────────
+// ── Install / Activate ────────────────────────────────────────────
 self.addEventListener('install',  () => self.skipWaiting());
 self.addEventListener('activate', (event) => {
-  // Pass a never-resolving promise directly to waitUntil.
-  // This is the correct pattern: the SW's activate event never "completes",
-  // so Android Chrome cannot mark the SW as idle and terminate it.
-  // The Web Lock is a belt-and-suspenders backup; the waitUntil is the primary.
+  // IMPORTANT: event.waitUntil() MUST resolve promptly.
+  // Chrome blocks all fetch() calls from completing until the activate event
+  // resolves. If we pass a never-resolving promise here, the first page load
+  // after a fresh SW install hangs forever — HTML arrives (10%) but all JS/CSS
+  // assets are blocked waiting for activate to finish.
+  //
+  // Fix: waitUntil only wraps clients.claim() (which resolves quickly).
+  // The Web Lock keep-alive is started in a fire-and-forget call AFTER
+  // claim() resolves, so it never blocks fetch events.
   event.waitUntil(
     self.clients.claim().then(() => {
+      // Fire-and-forget: acquires an indefinite Web Lock to prevent Android
+      // from terminating the SW process. Does NOT block the activate event.
       acquireKeepAliveLock();
-      // Return a promise that never resolves — keeps the activate event
-      // permanently pending, preventing Android from garbage-collecting the SW.
-      return new Promise(() => {});
     })
   );
 });
