@@ -283,6 +283,12 @@ self.addEventListener('message', (event) => {
       break;
     }
 
+    case 'SKIP_WAITING': {
+      // Main thread (update banner) requests immediate SW activation.
+      self.skipWaiting();
+      break;
+    }
+
     case 'sw_hard_resync': {
       // Main thread requests immediate position — send a ping burst
       // AND request a fresh sync message from the server.

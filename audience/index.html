@@ -517,6 +517,33 @@
     }
     .btn-reset-offset:active { color: var(--danger); border-color: var(--danger); }
 
+    /* ── Update Banner ── */
+    #update-banner {
+      position: fixed;
+      top: env(safe-area-inset-top, 0);
+      left: 0;
+      right: 0;
+      z-index: 9999;
+      background: var(--accent);
+      color: white;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 14px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 20px rgba(42,157,143,0.5);
+      animation: slideDown 0.3s ease;
+    }
+    #update-banner.visible { display: flex; }
+    @keyframes slideDown {
+      from { transform: translateY(-100%); opacity: 0; }
+      to   { transform: translateY(0);    opacity: 1; }
+    }
+    #update-banner:active { background: var(--accent-hover); }
+
     /* Error screen */
     #screen-error {
       align-items: center;
@@ -531,6 +558,11 @@
   </style>
 </head>
 <body>
+
+  <!-- ── Update Banner ── -->
+  <div id="update-banner" role="button" tabindex="0" aria-label="New version available, tap to update">
+    <span>&#8635;</span> New version available — tap to update
+  </div>
 
   <!-- ── Join Screen ── -->
   <div class="screen active" id="screen-join">

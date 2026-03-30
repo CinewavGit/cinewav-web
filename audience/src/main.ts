@@ -908,6 +908,27 @@ document.addEventListener('visibilitychange', async () => {
 
 // ── Service Worker Setup ──────────────────────────────────────────────────────
 
+// ── SW Update Banner ─────────────────────────────────────────────────────────────
+function showUpdateBanner(waitingSW: ServiceWorker) {
+  const banner = document.getElementById('update-banner') as HTMLDivElement | null;
+  if (!banner) return;
+  banner.classList.add('visible');
+
+  const activate = () => {
+    // Tell the waiting SW to skip waiting and become the active SW immediately.
+    waitingSW.postMessage({ type: 'SKIP_WAITING' });
+    // Reload once the new SW takes control.
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      window.location.reload();
+    }, { once: true });
+  };
+
+  banner.addEventListener('click', activate, { once: true });
+  banner.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') activate();
+  }, { once: true });
+}
+
 // Main-thread watchdog: if the SW goes silent for >25 seconds while we are
 // supposed to be connected, force a hard resync. This catches the case where
 // Android Chrome kills the SW process silently (no sw_disconnected message).
@@ -957,7 +978,24 @@ async function registerSyncWorker(wsUrl: string): Promise<void> {
   // the install side; update() + clients.claim() handles the activate side.
   try {
     const reg = await navigator.serviceWorker.getRegistration();
-    if (reg) await reg.update();
+    if (reg) {
+      await reg.update();
+
+      // If a new SW is already waiting (downloaded but not yet active),
+      // show the update banner so the user can activate it with one tap.
+      if (reg.waiting) showUpdateBanner(reg.waiting);
+
+      // Also listen for future waiting SWs (e.g. update arrives while app is open).
+      reg.addEventListener('updatefound', () => {
+        const newSW = reg.installing;
+        if (!newSW) return;
+        newSW.addEventListener('statechange', () => {
+          if (newSW.state === 'installed' && navigator.serviceWorker.controller) {
+            showUpdateBanner(newSW);
+          }
+        });
+      });
+    }
   } catch { /* ignore — update is best-effort */ }
 
   if (navigator.serviceWorker.controller) {
