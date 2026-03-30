@@ -556,6 +556,7 @@ function stopPlayback() {
   isPlaying = false;
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
+  updateMediaSession(); // update OS session to 'paused' so Samsung doesn't kill us
 }
 
 // ── UI Loop ───────────────────────────────────────────────────────────────────
@@ -567,6 +568,9 @@ function startUILoop() {
     const clamped = Math.min(pos, audioDuration);
     pCurrentTime.textContent = formatTime(clamped);
     if (audioDuration > 0) seekFill.style.width = `${(clamped / audioDuration) * 100}%`;
+    // Update MediaSession position state every 250ms so the OS lock-screen
+    // widget shows the correct playhead and Samsung sees an active session.
+    updateMediaSession();
   }, 250);
 }
 
@@ -663,6 +667,11 @@ function stopPostShowPolling() {
 }
 
 // ── Media Session ─────────────────────────────────────────────────────────────
+// Samsung One UI aggressively kills Chrome processes on screen lock unless the
+// page has a fully-registered MediaSession (metadata + playbackState + action
+// handlers). Without action handlers, Samsung treats the session as incomplete
+// and terminates it. With a complete session, Samsung's battery manager treats
+// Chrome the same as Spotify or YouTube — it survives screen lock.
 function setupMediaSession(title: string) {
   if (!('mediaSession' in navigator)) return;
   navigator.mediaSession.metadata = new MediaMetadata({
@@ -672,11 +681,54 @@ function setupMediaSession(title: string) {
       { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
     ],
   });
+
+  // Register all standard action handlers so Samsung recognises this as a
+  // legitimate media session. The handlers mirror what the play/pause button
+  // and resync button already do — they just expose them to the OS.
+  navigator.mediaSession.setActionHandler('play', () => {
+    if (!audioBuffer) return;
+    ensureAudioContext();
+    resumeAudioContext().catch(() => {});
+    const rawPos = getEstimatedMasterPosition();
+    startPlayback(rawPos);
+    setSyncStatus('synced', 'In sync');
+  });
+
+  navigator.mediaSession.setActionHandler('pause', () => {
+    stopPlayback();
+    pendingPlaybackPos = null;
+    setSyncStatus('synced', 'Paused locally');
+  });
+
+  navigator.mediaSession.setActionHandler('seekto', (details) => {
+    if (details.seekTime != null) startPlayback(details.seekTime);
+  });
+
+  navigator.mediaSession.setActionHandler('seekbackward', () => {
+    startPlayback(Math.max(0, getCurrentPosition() - 10));
+  });
+
+  navigator.mediaSession.setActionHandler('seekforward', () => {
+    startPlayback(Math.min(audioDuration, getCurrentPosition() + 10));
+  });
 }
 
 function updateMediaSession() {
   if (!('mediaSession' in navigator)) return;
   navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+
+  // Update position state so the OS lock-screen media widget shows the
+  // correct playhead position. This also signals to Samsung's battery manager
+  // that the media session is actively progressing.
+  if (isPlaying && audioDuration > 0) {
+    try {
+      navigator.mediaSession.setPositionState({
+        duration:     audioDuration,
+        position:     Math.min(getCurrentPosition(), audioDuration),
+        playbackRate: 1,
+      });
+    } catch { /* setPositionState not supported on all browsers */ }
+  }
 }
 
 // ── Play/Pause Button ─────────────────────────────────────────────────────────
