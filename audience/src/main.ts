@@ -666,6 +666,39 @@ function stopPostShowPolling() {
   }
 }
 
+// ── Background Sync Heartbeat (Samsung screen-lock recovery) ─────────────────
+// Samsung One UI kills the Chrome renderer (and therefore the Service Worker)
+// within 1-3 seconds of screen lock, even with Web Lock + event.waitUntil held.
+// The SW reconnects automatically (1s timer), but the main thread has no way
+// to know the screen is locked or that commands were missed.
+//
+// Solution: while the show is playing, the main thread sends a sw_hard_resync
+// every 5 seconds. After the SW reconnects (1s), the next poll fires within
+// 4 seconds at most, delivering a fresh authoritative position from the server.
+// Worst-case sync gap on Samsung = ~5 seconds (1s reconnect + up to 4s poll).
+//
+// This also keeps the SW alive on stock Android as a belt-and-suspenders
+// measure alongside the Web Lock and waitUntil keep-alive.
+let bgSyncHeartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+function startBgSyncHeartbeat() {
+  if (bgSyncHeartbeatInterval) return;
+  bgSyncHeartbeatInterval = setInterval(() => {
+    // Only poll while the show is supposed to be playing. When paused, the
+    // master position is static so there is nothing to catch up to.
+    if (masterIsPlaying) {
+      sendToSW({ type: 'sw_hard_resync' });
+    }
+  }, 5000);
+}
+
+function stopBgSyncHeartbeat() {
+  if (bgSyncHeartbeatInterval) {
+    clearInterval(bgSyncHeartbeatInterval);
+    bgSyncHeartbeatInterval = null;
+  }
+}
+
 // ── Media Session ─────────────────────────────────────────────────────────────
 // Samsung One UI aggressively kills Chrome processes on screen lock unless the
 // page has a fully-registered MediaSession (metadata + playbackState + action
@@ -872,6 +905,12 @@ function handleSWMessage(event: MessageEvent) {
   switch (msg.type) {
     case 'sw_connected':
       setSyncStatus('syncing', 'Syncing clock…');
+      // On reconnect (SW was killed and restarted — common on Samsung screen lock),
+      // immediately request a fresh server position so the device snaps back to
+      // the master without waiting for the next background poll interval.
+      if (msg.isReconnect) {
+        sendToSW({ type: 'sw_hard_resync' });
+      }
       break;
 
     case 'sw_disconnected':
@@ -931,9 +970,7 @@ async function handleAudioReady(filename: string, hash: string) {
 }
 
 // ── Visibility Change — Hard Resync on Screen Wake ────────────────────────────
-document.addEventListener('visibilitychange', async () => {
-  if (document.hidden) return;
-
+async function handleScreenWake() {
   // Tab came back to foreground.
   // ensureAudioContext() recreates a closed context (Android screen-off + film end).
   // resumeAudioContext() handles suspended/interrupted states (iOS screen-lock).
@@ -956,6 +993,19 @@ document.addEventListener('visibilitychange', async () => {
   if (audioCtx?.state === 'running') {
     startSilentKeepalive();
   }
+}
+
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden) return;
+  await handleScreenWake();
+});
+
+// Samsung One UI sometimes fires 'pageshow' instead of 'visibilitychange'
+// when the screen is unlocked (bfcache restore path). Listen for both.
+window.addEventListener('pageshow', async (e) => {
+  // e.persisted = true means the page was restored from bfcache (screen wake).
+  // e.persisted = false is the initial page load — ignore it here.
+  if (e.persisted) await handleScreenWake();
 });
 
 // ── Service Worker Setup ──────────────────────────────────────────────────────
@@ -996,8 +1046,12 @@ function startSWWatchdog(wsUrl: string) {
   lastSWMessageAt = Date.now();
   swWatchdogTimer = setInterval(() => {
     const silentMs = Date.now() - lastSWMessageAt;
-    if (silentMs > 25000) {
-      // SW has been silent for >25s — it was likely killed by Android.
+    // 8 second threshold: Samsung One UI kills the SW within 1-3 seconds of
+    // screen lock. Detecting silence at 8s gives the SW time to reconnect
+    // (1s reconnect timer) and deliver a pong before we escalate, while
+    // still recovering much faster than the old 25s threshold.
+    if (silentMs > 8000) {
+      // SW has been silent for >8s — it was likely killed by Android.
       // Force an immediate reconnect: re-register the SW and reinitialise.
       console.warn('[Watchdog] SW silent for', silentMs, 'ms — forcing reconnect');
       lastSWMessageAt = Date.now(); // reset so we don't fire again immediately
@@ -1225,6 +1279,9 @@ async function joinShow() {
     const wsUrl = serverBaseUrl.replace(/^http/, 'ws') + `/api/show/${showId}/ws`;
     await registerSyncWorker(wsUrl);
     setSyncStatus('syncing', 'Syncing clock…');
+    // Start the background sync heartbeat that keeps the device in sync
+    // even when Samsung kills the SW on screen lock.
+    startBgSyncHeartbeat();
 
     // 7. Decode audio
     if (audioData) {

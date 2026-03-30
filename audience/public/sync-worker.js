@@ -113,7 +113,11 @@ function connectWs() {
     }));
     startBurst();
     startHeartbeat();  // keep WS alive through Android NAT timeouts and idle detection
-    broadcast({ type: 'sw_connected' });
+    // isReconnect = true when this is NOT the first connection of this SW
+    // instance. The main thread uses this to trigger an immediate resync
+    // so the device snaps to the current master position without waiting
+    // for the next poll interval.
+    broadcast({ type: 'sw_connected', isReconnect: (offsetHistory.length > 0) });
   };
 
   ws.onmessage = (event) => {
@@ -134,7 +138,10 @@ function connectWs() {
 
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connectWs, 3000);
+  // 1 second reconnect — fast recovery is critical on Samsung where the SW
+  // process is killed on screen lock. The sooner we reconnect, the sooner
+  // the main-thread polling loop can deliver a fresh server position.
+  reconnectTimer = setTimeout(connectWs, 1000);
 }
 
 function broadcastCommand(msg) {
