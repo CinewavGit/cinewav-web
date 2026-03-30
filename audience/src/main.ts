@@ -81,6 +81,7 @@ let audioCtx:        AudioContext | null          = null;
 let audioBuffer:     AudioBuffer  | null          = null;
 let sourceNode:      AudioBufferSourceNode | null = null;
 let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepalive
+let androidKeepalive: HTMLAudioElement | null = null;        // Android AudioManager keepalive
 let isPlaying         = false;
 let playStartWallTime = 0;  // Date.now() when playback started (wall clock, not audio clock)
 let playStartPos      = 0;  // audio position (seconds) when playback started
@@ -316,6 +317,7 @@ function ensureAudioContext() {
       try { keepaliveNode.stop(); } catch { /* already stopped */ }
       keepaliveNode = null;
     }
+    stopAndroidKeepalive();
     isPlaying = false;
 
     // iOS silent-switch fix: set audio session to 'playback' BEFORE creating
@@ -401,9 +403,22 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
  * Keeps the AudioContext alive on iOS when screen is locked — without using
  * a looping HTMLAudioElement (which caused 1-second OS media interruptions).
  * A looping silent AudioBufferSourceNode is invisible to the OS media session.
+ *
+ * Android fix: ALSO start an HTMLAudioElement playing silent.mp3 in a loop.
+ * The AudioBufferSourceNode is invisible to Android's AudioManager, so Samsung
+ * One UI terminates the Chrome renderer within 3 seconds of screen lock.
+ * An HTMLAudioElement registers with Android's AudioManager (the same API
+ * Spotify/YouTube use), which tells Samsung's battery manager this process is
+ * actively playing audio — do not suspend it.
+ *
+ * iOS note: the HTMLAudioElement is NOT started on iOS because it causes
+ * 1-second OS media interruptions on each loop iteration. iOS only needs the
+ * AudioBufferSourceNode to keep the AudioContext alive.
  */
 function startSilentKeepalive() {
   if (!audioCtx || audioCtx.state !== 'running') return;
+
+  // ── AudioBufferSourceNode (iOS + all platforms) ──────────────────────────
   if (keepaliveNode) {
     try { keepaliveNode.stop(); } catch { /* already stopped */ }
     keepaliveNode = null;
@@ -416,6 +431,41 @@ function startSilentKeepalive() {
   node.connect(audioCtx.destination);
   node.start(0);
   keepaliveNode = node;
+
+  // ── HTMLAudioElement (Android only) ──────────────────────────────────────
+  // Detect Android: navigator.userAgent contains 'Android' and NOT 'iPhone'/'iPad'.
+  // We skip this on iOS to avoid the 1-second interruption bug.
+  const isAndroid = /Android/i.test(navigator.userAgent) && !/iPhone|iPad/i.test(navigator.userAgent);
+  if (isAndroid) {
+    startAndroidKeepalive();
+  }
+}
+
+/**
+ * Start the Android HTMLAudioElement keepalive.
+ * Plays silent.mp3 in a loop to register with Android's AudioManager.
+ * This prevents Samsung One UI from killing the Chrome renderer on screen lock.
+ * Safe to call multiple times — idempotent.
+ */
+function startAndroidKeepalive() {
+  if (androidKeepalive) return; // already running
+  const audio = new Audio('/silent.mp3');
+  audio.loop   = true;
+  audio.volume = 0.001; // effectively silent but non-zero to avoid OS optimisation
+  audio.play().catch(() => {
+    // Autoplay blocked — this should not happen here because we are called
+    // from within startPlayback() which is triggered by a user gesture or
+    // an incoming sync command after the user has already interacted.
+    // If it does fail, the AudioBufferSourceNode keepalive still works for iOS.
+  });
+  androidKeepalive = audio;
+}
+
+function stopAndroidKeepalive() {
+  if (!androidKeepalive) return;
+  androidKeepalive.pause();
+  androidKeepalive.src = '';
+  androidKeepalive = null;
 }
 
 /**
