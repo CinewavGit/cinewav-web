@@ -103,6 +103,12 @@ let masterIsPlaying  = false;
 let masterPosition   = 0;
 let masterPositionAt = 0;   // Date.now() on main thread — FIX 1
 
+// WebSocket connection state — true only when the SW has an open connection.
+// All playback that depends on server position is gated behind this flag.
+// When false, the play button and resync button are disabled and show
+// "Reconnecting…" so the user cannot start independent playback.
+let swConnected = false;
+
 // Pending command received before audio was decoded
 let pendingCommand: ShowCommand | null = null;
 
@@ -204,6 +210,31 @@ function setSyncStatus(status: SyncStatusType, label: string) {
     status === 'syncing' ? 'syncing' : ''
   }`;
   syncStatusText.textContent = label;
+}
+
+// ── Connection State Gate ────────────────────────────────────────────────────
+// Centralises all UI changes that depend on whether the WebSocket is live.
+// When disconnected: play/resync buttons are disabled, status shows reconnecting.
+// When reconnected: buttons re-enable and an immediate server resync is requested
+// so the device snaps to the authoritative master state without any local guessing.
+function setConnectionState(connected: boolean) {
+  swConnected = connected;
+  if (!connected) {
+    // Disable interactive controls so the user cannot start independent playback
+    playPauseBtn.disabled = true;
+    resyncBtn.disabled    = true;
+    setSyncStatus('waiting', 'Reconnecting…');
+  } else {
+    // Re-enable controls only if audio is loaded
+    if (audioBuffer) {
+      playPauseBtn.disabled = false;
+      resyncBtn.disabled    = false;
+    }
+    // Always request a fresh authoritative state on reconnect.
+    // Do NOT use stale local masterIsPlaying/masterPosition — they may be
+    // completely wrong after a long pause or missed commands.
+    sendToSW({ type: 'sw_hard_resync' });
+  }
 }
 
 function loadManualOffset() {
@@ -734,11 +765,16 @@ let bgSyncHeartbeatInterval: ReturnType<typeof setInterval> | null = null;
 function startBgSyncHeartbeat() {
   if (bgSyncHeartbeatInterval) return;
   bgSyncHeartbeatInterval = setInterval(() => {
-    // Only poll while the show is supposed to be playing. When paused, the
-    // master position is static so there is nothing to catch up to.
-    if (masterIsPlaying) {
-      sendToSW({ type: 'sw_hard_resync' });
-    }
+    // Always send a heartbeat regardless of play/pause state.
+    // Rationale: when the master is paused for a long time, the SW WebSocket
+    // can still be killed by Android (long idle = no pings = NAT timeout or
+    // OS idle detection). The heartbeat keeps the WS alive AND ensures that
+    // when the master eventually hits play, the device is already connected
+    // and receives the play command in real time instead of missing it.
+    // The SW's own 4s keepalive ping handles the WS-level keepalive, but
+    // this main-thread heartbeat also catches the case where the SW itself
+    // was killed and needs to be woken up via a message.
+    sendToSW({ type: 'sw_hard_resync' });
   }, 5000);
 }
 
@@ -770,11 +806,16 @@ function setupMediaSession(title: string) {
   // and resync button already do — they just expose them to the OS.
   navigator.mediaSession.setActionHandler('play', () => {
     if (!audioBuffer) return;
-    ensureAudioContext();
-    resumeAudioContext().catch(() => {});
-    const rawPos = getEstimatedMasterPosition();
-    startPlayback(rawPos);
-    setSyncStatus('synced', 'In sync');
+    if (!swConnected) {
+      // OS lock-screen play button pressed while disconnected.
+      // Request reconnect; the server reply will start playback at the correct position.
+      setSyncStatus('waiting', 'Reconnecting…');
+      sendToSW({ type: 'sw_hard_resync' });
+      return;
+    }
+    // Connected — request fresh state from server so we start at the right position.
+    sendToSW({ type: 'sw_hard_resync' });
+    setSyncStatus('syncing', 'Syncing…');
   });
 
   navigator.mediaSession.setActionHandler('pause', () => {
@@ -824,15 +865,20 @@ playPauseBtn.addEventListener('click', () => {
   if (!audioBuffer) return;
 
   if (isPlaying) {
+    // Pausing locally is always allowed — it does not depend on the connection.
     stopPlayback();
     pendingPlaybackPos = null;
     setSyncStatus('synced', 'Paused locally');
   } else {
-    ensureAudioContext();
-    resumeAudioContext().catch(() => {});
-    const rawPos = getEstimatedMasterPosition();
-    startPlayback(rawPos);
-    setSyncStatus('synced', 'In sync');
+    // Starting playback requires a live connection so we get the authoritative
+    // position from the server. Never start from a stale local estimate.
+    if (!swConnected) {
+      setSyncStatus('waiting', 'Reconnecting…');
+      return;
+    }
+    // Request fresh state from server; the incoming sw_command will start playback.
+    sendToSW({ type: 'sw_hard_resync' });
+    setSyncStatus('syncing', 'Syncing…');
   }
 });
 
@@ -911,7 +957,15 @@ function doManualResync() {
 }
 
 resyncBtn.addEventListener('click', () => {
+  if (!swConnected) {
+    // Not connected — request reconnect and show status; do not use stale local position.
+    setSyncStatus('waiting', 'Reconnecting…');
+    sendToSW({ type: 'sw_hard_resync' });
+    return;
+  }
   sendToSW({ type: 'sw_hard_resync' });
+  // Only apply local resync if we have a fresh-enough clock (burst complete).
+  // The server reply will arrive within ~200ms and override this anyway.
   doManualResync();
   resyncBtn.textContent = '✓ Synced!';
   setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
@@ -954,17 +1008,18 @@ function handleSWMessage(event: MessageEvent) {
   resetSWWatchdog(); // any message from SW means it's alive
   switch (msg.type) {
     case 'sw_connected':
+      // setConnectionState(true) re-enables buttons, sets status, and sends
+      // sw_hard_resync so the device always gets authoritative state on reconnect.
+      // This replaces the old isReconnect-only path: we ALWAYS resync on connect
+      // because even the first connection needs the current server state.
+      setConnectionState(true);
       setSyncStatus('syncing', 'Syncing clock…');
-      // On reconnect (SW was killed and restarted — common on Samsung screen lock),
-      // immediately request a fresh server position so the device snaps back to
-      // the master without waiting for the next background poll interval.
-      if (msg.isReconnect) {
-        sendToSW({ type: 'sw_hard_resync' });
-      }
       break;
 
     case 'sw_disconnected':
-      setSyncStatus('waiting', 'Reconnecting…');
+      // setConnectionState(false) disables buttons and shows "Reconnecting…"
+      // so the user cannot start independent playback while the WS is down.
+      setConnectionState(false);
       break;
 
     case 'sw_clock':
