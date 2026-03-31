@@ -517,6 +517,122 @@
     }
     .btn-reset-offset:active { color: var(--danger); border-color: var(--danger); }
 
+    /* ── Android Battery Prompt ── */
+    #android-battery-prompt {
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      background: rgba(0,0,0,0.85);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      backdrop-filter: blur(6px);
+    }
+    #android-battery-prompt.visible { display: flex; }
+
+    .battery-prompt-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px 24px;
+      max-width: 360px;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      text-align: center;
+    }
+
+    .battery-prompt-icon {
+      font-size: 48px;
+      line-height: 1;
+    }
+
+    .battery-prompt-title {
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .battery-prompt-body {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.6;
+      text-align: left;
+    }
+
+    .battery-prompt-steps {
+      background: var(--surface2);
+      border-radius: 12px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      text-align: left;
+    }
+
+    .battery-prompt-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .battery-step-num {
+      flex-shrink: 0;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: white;
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 1px;
+    }
+
+    .battery-prompt-note {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    .battery-prompt-btns {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .btn-battery-done {
+      padding: 14px;
+      border: none;
+      border-radius: 12px;
+      background: var(--accent);
+      color: white;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-battery-done:active { transform: scale(0.97); }
+
+    .btn-battery-skip {
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-battery-skip:active { color: var(--text); }
+
     /* ── Update Banner ── */
     #update-banner {
       position: fixed;
@@ -558,6 +674,44 @@
   </style>
 </head>
 <body>
+
+  <!-- ── Android Battery Prompt ── -->
+  <div id="android-battery-prompt" role="dialog" aria-modal="true" aria-label="Enable background audio">
+    <div class="battery-prompt-card">
+      <div class="battery-prompt-icon">🔋</div>
+      <div class="battery-prompt-title">One quick step for Samsung</div>
+      <p class="battery-prompt-body">
+        Samsung's battery manager can disconnect audio while your screen is locked.
+        Allow Chrome to run in the background so the show stays in sync.
+      </p>
+      <div class="battery-prompt-steps">
+        <div class="battery-prompt-step">
+          <div class="battery-step-num">1</div>
+          <span>Open your phone's <strong>Settings</strong> app</span>
+        </div>
+        <div class="battery-prompt-step">
+          <div class="battery-step-num">2</div>
+          <span>Go to <strong>Apps → Chrome</strong></span>
+        </div>
+        <div class="battery-prompt-step">
+          <div class="battery-step-num">3</div>
+          <span>Tap <strong>App battery usage</strong> (or Battery)</span>
+        </div>
+        <div class="battery-prompt-step">
+          <div class="battery-step-num">4</div>
+          <span>Change from <strong>Optimised</strong> to <strong>Unrestricted</strong></span>
+        </div>
+      </div>
+      <p class="battery-prompt-note">
+        This only affects Chrome and does not drain your battery noticeably.
+        You only need to do this once.
+      </p>
+      <div class="battery-prompt-btns">
+        <button class="btn-battery-done" id="battery-prompt-done">Done — I've changed the setting</button>
+        <button class="btn-battery-skip" id="battery-prompt-skip">Skip for now</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ── Update Banner ── -->
   <div id="update-banner" role="button" tabindex="0" aria-label="New version available, tap to update">

@@ -1386,3 +1386,37 @@ joinBtn.addEventListener('click', () => {
     }
   });
 });
+
+// ── Android Battery Prompt ────────────────────────────────────────────────────
+// Samsung One UI kills Chrome's renderer process within 3 seconds of screen
+// lock unless Chrome has "Unrestricted" battery usage. No JavaScript technique
+// can override this OS-level policy. The only reliable fix is a one-time user
+// setting change. We detect Android and show this prompt once per device.
+const BATTERY_PROMPT_KEY = 'cinewav_battery_prompt_done';
+const androidBatteryPrompt = document.getElementById('android-battery-prompt')!;
+const batteryPromptDone    = document.getElementById('battery-prompt-done')!;
+const batteryPromptSkip    = document.getElementById('battery-prompt-skip')!;
+
+function isAndroidDevice(): boolean {
+  return /Android/i.test(navigator.userAgent) && !/iPhone|iPad/i.test(navigator.userAgent);
+}
+
+function showAndroidBatteryPrompt() {
+  if (!isAndroidDevice()) return;
+  if (localStorage.getItem(BATTERY_PROMPT_KEY)) return;
+  androidBatteryPrompt.classList.add('visible');
+}
+
+function dismissAndroidBatteryPrompt(remember: boolean) {
+  androidBatteryPrompt.classList.remove('visible');
+  if (remember) {
+    localStorage.setItem(BATTERY_PROMPT_KEY, '1');
+  }
+}
+
+batteryPromptDone.addEventListener('click', () => dismissAndroidBatteryPrompt(true));
+batteryPromptSkip.addEventListener('click', () => dismissAndroidBatteryPrompt(false));
+
+// Show the prompt on first load for Android devices that haven't dismissed it.
+// We show it on the join screen so the user can act before the show starts.
+showAndroidBatteryPrompt();
