@@ -516,15 +516,26 @@ function startSilentKeepalive() {
  */
 function startAndroidKeepalive() {
   if (androidKeepalive) return; // already running
-  const audio = new Audio('/silent.mp3');
+  const audio = new Audio('/silent60.mp3');
+  audio.crossOrigin = 'anonymous';
+  audio.preload = 'auto';
+  audio.playsInline = true;
   audio.loop   = true;
-  audio.volume = 0.001; // effectively silent but non-zero to avoid OS optimisation
-  audio.play().catch(() => {
+  audio.volume = 0.01; // effectively silent but non-zero to avoid OS optimisation
+  audio.muted = true;
+  audio.play().then(() => { audio.muted = false; }).catch(() => {
     // Autoplay blocked — this should not happen here because we are called
     // from within startPlayback() which is triggered by a user gesture or
     // an incoming sync command after the user has already interacted.
     // If it does fail, the AudioBufferSourceNode keepalive still works for iOS.
   });
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'Cinewav Sync',
+      artist: 'Cinewav',
+      album: 'Live Event'
+    });
+  }
   androidKeepalive = audio;
 }
 
