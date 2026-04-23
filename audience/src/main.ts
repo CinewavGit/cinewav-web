@@ -71,6 +71,7 @@ const errorMsg           = document.getElementById('error-msg')!;
 const syncControlsEl     = document.getElementById('sync-controls')!;
 const playPauseBtn       = document.getElementById('play-pause-btn')   as HTMLButtonElement;
 const resyncBtn          = document.getElementById('resync-btn')       as HTMLButtonElement;
+const redownloadBtn      = document.getElementById('redownload-btn')   as HTMLButtonElement;
 const ftMinus            = document.getElementById('ft-minus')         as HTMLButtonElement;
 const ftPlus             = document.getElementById('ft-plus')          as HTMLButtonElement;
 const ftReset            = document.getElementById('ft-reset')         as HTMLButtonElement;
@@ -225,14 +226,16 @@ function setConnectionState(connected: boolean) {
   swConnected = connected;
   if (!connected) {
     // Disable interactive controls so the user cannot start independent playback
-    playPauseBtn.disabled = true;
-    resyncBtn.disabled    = true;
+    playPauseBtn.disabled  = true;
+    resyncBtn.disabled     = true;
+    redownloadBtn.disabled = true;
     setSyncStatus('waiting', 'Reconnecting…');
   } else {
     // Re-enable controls only if audio is loaded
     if (audioBuffer) {
-      playPauseBtn.disabled = false;
-      resyncBtn.disabled    = false;
+      playPauseBtn.disabled  = false;
+      resyncBtn.disabled     = false;
+      redownloadBtn.disabled = false;
     }
     // Always request a fresh authoritative state on reconnect.
     // Do NOT use stale local masterIsPlaying/masterPosition — they may be
@@ -428,6 +431,7 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
   pTotalTime.textContent = formatTime(audioDuration);
   playPauseBtn.disabled  = false;
   resyncBtn.disabled     = false;
+  redownloadBtn.disabled = false;
   // Android fix C: start the health-check timer that recovers from silent
   // AudioContext suspension (statechange may not fire on Android Chrome).
   startHealthCheck();
@@ -973,6 +977,61 @@ resyncBtn.addEventListener('click', () => {
   doManualResync();
   resyncBtn.textContent = '✓ Synced!';
   setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
+});
+
+// ── Force Re-download ───────────────────────────────────────────────────────────
+// Clears the local IndexedDB audio cache for this show and re-fetches the
+// current file from the server. Use when the master has uploaded a new audio
+// file but the device is still playing the old cached version.
+redownloadBtn.addEventListener('click', async () => {
+  if (!showId || !serverBaseUrl) return;
+  redownloadBtn.disabled = true;
+  redownloadBtn.textContent = 'Clearing cache…';
+
+  // 1. Delete the cached audio for this show
+  const { deleteAudio } = await import('./audioStorage');
+  await deleteAudio(showId);
+
+  // 2. Fetch the current server state to get the latest filename + hash
+  redownloadBtn.textContent = 'Fetching…';
+  try {
+    const stateRes = await fetch(`${serverBaseUrl}/api/show/${showId}/state`);
+    if (!stateRes.ok) throw new Error(`Server error: ${stateRes.status}`);
+    const state = await stateRes.json() as {
+      audioFile?: string;
+      audioHash?: string;
+      audioReady?: boolean;
+    };
+
+    if (!state.audioReady || !state.audioFile) {
+      redownloadBtn.textContent = 'No audio on server';
+      setTimeout(() => {
+        redownloadBtn.innerHTML = '&#8635; Force Re-download Audio';
+        redownloadBtn.disabled = false;
+      }, 2000);
+      return;
+    }
+
+    // 3. Download the new file
+    setSyncStatus('syncing', 'Downloading audio…');
+    trackName.textContent = 'Downloading audio…';
+    const { saveAudio } = await import('./audioStorage');
+    const buf = await downloadAudioFile(
+      `${serverBaseUrl}/api/show/${showId}/audio`,
+      state.audioFile,
+    );
+    await saveAudio(showId, state.audioFile, buf, state.audioHash || '');
+    await initAudio(buf);
+    trackName.textContent = state.audioFile;
+    setupMediaSession(state.audioFile);
+    setSyncStatus('waiting', 'Audio ready — waiting for show');
+    redownloadBtn.innerHTML = '&#8635; Force Re-download Audio';
+    redownloadBtn.disabled = false;
+  } catch (err) {
+    setSyncStatus('waiting', 'Download failed — retry');
+    redownloadBtn.innerHTML = '&#8635; Force Re-download Audio';
+    redownloadBtn.disabled = false;
+  }
 });
 
 // ── Fine-Tune Offset Controls ─────────────────────────────────────────────────

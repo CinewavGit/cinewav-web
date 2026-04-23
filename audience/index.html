@@ -449,6 +449,28 @@
     .btn-resync:active { transform: scale(0.97); background: var(--accent-hover, #8b85ff); }
     .btn-resync:disabled { opacity: 0.35; cursor: not-allowed; }
 
+    /* Force re-download button — small, muted, below fine-tune */
+    .btn-redownload {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .btn-redownload:hover { border-color: var(--warning); color: var(--warning); }
+    .btn-redownload:active { transform: scale(0.97); }
+    .btn-redownload:disabled { opacity: 0.35; cursor: not-allowed; }
+
     /* Fine-tune row */
     .fine-tune-row {
       display: flex;
@@ -803,6 +825,12 @@
           <button class="fine-tune-btn" id="ft-plus" aria-label="Shift audio later by 100ms">+100ms</button>
           <button class="btn-reset-offset" id="ft-reset">Reset</button>
         </div>
+
+        <!-- Force re-download: clears the local audio cache and re-fetches from server.
+             Use when the audio file was replaced but the device is still playing the old version. -->
+        <button class="btn-redownload" id="redownload-btn" disabled title="Clear cached audio and re-download the current file from the server">
+          &#8635; Force Re-download Audio
+        </button>
       </div>
 
       <div class="sync-stats">

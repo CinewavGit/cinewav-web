@@ -521,12 +521,23 @@ workerUrlInput.addEventListener('change', () => {
 // ── Audio Upload ─────────────────────────────────────────────────────────────
 
 /**
- * Compute a simple hash of the file for cache-busting on the audience side.
- * We use the file size + last modified time as a lightweight fingerprint.
- * For production, you could use SHA-256 via SubtleCrypto.
+ * Compute a SHA-256 hash of the file content for cache-busting on the audience side.
+ *
+ * The old approach (size + lastModified) was not unique enough: two audio files
+ * exported from the same project with the same duration and codec settings often
+ * produce identical size values, and lastModified is only second-precision on some
+ * systems. This caused the audience device to see a hash match and skip the download
+ * even when the audio content had changed.
+ *
+ * SHA-256 via SubtleCrypto is cryptographically unique — any byte difference in the
+ * file content produces a completely different hash. It runs entirely in the browser
+ * (no server round-trip) and takes ~200ms for a 38 MB file on a modern device.
  */
-function fileFingerprint(file: File): string {
-  return `${file.size}-${file.lastModified}`;
+async function fileFingerprint(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  const hashBuf = await crypto.subtle.digest('SHA-256', buf);
+  const hashArr = Array.from(new Uint8Array(hashBuf));
+  return hashArr.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function uploadAudioFile(file: File) {
@@ -540,7 +551,6 @@ async function uploadAudioFile(file: File) {
   }
 
   const filename = file.name;
-  const hash = fileFingerprint(file);
   const uploadUrl = `${currentWorkerBase.replace(/^ws/, 'http')}/api/show/${currentShowId}/audio`;
 
   // Show progress UI
@@ -550,6 +560,13 @@ async function uploadAudioFile(file: File) {
   uploadFilenameEl.textContent = filename;
   uploadPercentEl.textContent = '0%';
   uploadBarFill.style.width = '0%';
+
+  // Compute SHA-256 hash before upload — this takes ~200ms for a 38 MB file.
+  // Show a brief 'Hashing…' status so the user knows the UI is not frozen.
+  log(`Hashing audio: ${filename} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
+  uploadPercentEl.textContent = 'Hashing…';
+  const hash = await fileFingerprint(file);
+  uploadPercentEl.textContent = '0%';
 
   log(`Uploading audio: ${filename} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
 
