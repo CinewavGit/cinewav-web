@@ -1575,24 +1575,21 @@ async function joinShow() {
       // Start silent keepalive to keep AudioContext alive on iOS screen lock (FIX 3)
       startSilentKeepalive();
 
-      if (pendingCommand) {
-        const cmd = pendingCommand;
-        pendingCommand = null;
-
-        if (cmd.action === 'play') {
-          const elapsed = (Date.now() - cmd.receivedAt) / 1000;
-          cmd.position += elapsed;
-          masterPosition   = cmd.position;
-          masterPositionAt = Date.now();
-        }
-        await handleShowCommand(cmd);
-
-      } else if (state.isPlaying) {
-        const masterPos = getEstimatedMasterPosition();
-        await resumeAudioContext();
-        startPlayback(masterPos - (manualOffsetMs / 1000));
-        setSyncStatus('synced', 'In sync');
-      }
+      // Always request a fresh authoritative state from the server after audio is
+      // decoded. This replaces the fragile pendingCommand + state.isPlaying logic:
+      //
+      // Problem: initAudio() takes several seconds for large files. During that
+      // time the SW releases the buffered 'welcome' as a sw_command, but
+      // handleShowCommand sees audioBuffer===null and stores it as pendingCommand.
+      // If the master is paused, pendingCommand.action === 'pause' and the old
+      // code fell through without starting playback — leaving the device stuck on
+      // 'Waiting for show to start' forever.
+      //
+      // Fix: discard pendingCommand and ask the server for current state instead.
+      // The server reply will carry the correct play/pause action and position,
+      // and handleShowCommand will process it with audioBuffer now available.
+      pendingCommand = null;
+      sendToSW({ type: 'sw_hard_resync' });
     }
 
   } catch (err) {
