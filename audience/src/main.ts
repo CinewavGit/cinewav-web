@@ -132,6 +132,11 @@ const DRIFT_CONFIRM_COUNT = 2;
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
+// Guard flag: true while an automatic re-download triggered by a hash mismatch
+// is in progress. Prevents multiple concurrent re-downloads from being started
+// by rapid sw_command messages that all carry the new audioHash.
+let isRedownloading = false;
+
 // WebSocket URL for the current show — stored at join time so handleScreenWake
 // can re-register the SW pipeline after a long screen-off kill without a reload.
 let currentWsUrl: string | null = null;
@@ -1132,13 +1137,14 @@ function handleSWMessage(event: MessageEvent) {
 
     case 'sw_command': {
       // If the server reports a different audioHash, trigger an automatic
-      // re-download before processing the playback command. This covers the
-      // case where the master uploaded a new file while the device was offline
-      // (missed the audio_ready WebSocket event) or when the device joins a
-      // show that already has a different audio file than what is cached.
-      if (msg.audioHash && showId) {
+      // re-download. Only fires once per hash change (guarded by isRedownloading)
+      // and only when a download is not already in progress.
+      if (msg.audioHash && showId && !isRedownloading) {
         loadAudio(showId).then(existing => {
-          if (existing && existing.hash !== msg.audioHash && msg.audioFile) {
+          // Only re-download if we have a cached file with a DIFFERENT hash.
+          // If existing is null the join flow already handles the initial download.
+          // If hashes match, the cached file is correct — do nothing.
+          if (existing && existing.hash && existing.hash !== msg.audioHash && msg.audioFile) {
             handleAudioReady(msg.audioFile, msg.audioHash);
           }
         }).catch(() => {});
@@ -1169,6 +1175,10 @@ async function handleAudioReady(filename: string, hash: string) {
   const existing = await loadAudio(showId);
   if (existing?.hash === hash) return;
 
+  // Guard against concurrent re-downloads triggered by rapid sync messages.
+  if (isRedownloading) return;
+  isRedownloading = true;
+
   // Stop any currently-playing audio before replacing the buffer.
   // Without this the old audio keeps playing underneath the new file.
   stopPlayback();
@@ -1192,6 +1202,8 @@ async function handleAudioReady(filename: string, hash: string) {
   } catch {
     showScreen('player');
     setSyncStatus('waiting', 'Download failed — retry');
+  } finally {
+    isRedownloading = false;
   }
 }
 
