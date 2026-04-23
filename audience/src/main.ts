@@ -137,6 +137,13 @@ let syncSW: ServiceWorker | null = null;
 // by rapid sw_command messages that all carry the new audioHash.
 let isRedownloading = false;
 
+// Hash of the audio file currently loaded in memory.
+// Updated whenever audio is downloaded or loaded from IndexedDB.
+// Used in the sw_command handler to detect a new file without reading
+// IndexedDB on every message (which is slow on Android and caused a
+// 20–30 second startup delay).
+let currentAudioHash = '';
+
 // WebSocket URL for the current show — stored at join time so handleScreenWake
 // can re-register the SW pipeline after a long screen-off kill without a reload.
 let currentWsUrl: string | null = null;
@@ -1047,6 +1054,7 @@ redownloadBtn.addEventListener('click', async () => {
       state.audioFile,
     );
     await saveAudio(showId, state.audioFile, buf, state.audioHash || '');
+    currentAudioHash = state.audioHash || '';  // update in-memory hash
     await initAudio(buf);
 
     // 5. Return to the player screen — downloadAudioFile() switches to the
@@ -1136,18 +1144,21 @@ function handleSWMessage(event: MessageEvent) {
       break;
 
     case 'sw_command': {
-      // If the server reports a different audioHash, trigger an automatic
-      // re-download. Only fires once per hash change (guarded by isRedownloading)
-      // and only when a download is not already in progress.
-      if (msg.audioHash && showId && !isRedownloading) {
-        loadAudio(showId).then(existing => {
-          // Only re-download if we have a cached file with a DIFFERENT hash.
-          // If existing is null the join flow already handles the initial download.
-          // If hashes match, the cached file is correct — do nothing.
-          if (existing && existing.hash && existing.hash !== msg.audioHash && msg.audioFile) {
-            handleAudioReady(msg.audioFile, msg.audioHash);
-          }
-        }).catch(() => {});
+      // Detect a new audio file by comparing the server's audioHash against
+      // currentAudioHash — an in-memory variable updated whenever audio is
+      // loaded. This avoids reading IndexedDB on every sync message, which
+      // was causing a 20–30 second startup delay on Android (IndexedDB reads
+      // are async and slow; during the 16-ping burst they queued up and
+      // blocked the command queue from processing the play command).
+      if (
+        msg.audioHash &&
+        msg.audioFile &&
+        showId &&
+        !isRedownloading &&
+        currentAudioHash &&                        // we have audio loaded
+        currentAudioHash !== msg.audioHash         // it's a different file
+      ) {
+        handleAudioReady(msg.audioFile, msg.audioHash);
       }
       const cmd: ShowCommand = {
         action:        msg.action,
@@ -1189,6 +1200,7 @@ async function handleAudioReady(filename: string, hash: string) {
   try {
     const buf = await downloadAudioFile(`${serverBaseUrl}/api/show/${showId}/audio`, filename);
     await saveAudio(showId, filename, buf, hash);
+    currentAudioHash = hash;  // update in-memory hash so sw_command detects future changes
     await initAudio(buf);
     // Return to the player screen — downloadAudioFile() switches to the
     // download screen but never switches back.
@@ -1544,6 +1556,10 @@ async function joinShow() {
       await saveAudio(showId, state.audioFile, buf, state.audioHash || '');
       audioData = { filename: state.audioFile, hash: state.audioHash || '', data: buf };
     }
+
+    // Update the in-memory hash so sw_command can detect future file changes
+    // without reading IndexedDB on every message.
+    if (audioData?.hash) currentAudioHash = audioData.hash;
 
     // 4. Show player screen
     showScreen('player');
