@@ -131,6 +131,10 @@ const DRIFT_CONFIRM_COUNT = 2;
 // Service Worker reference
 let syncSW: ServiceWorker | null = null;
 
+// WebSocket URL for the current show — stored at join time so handleScreenWake
+// can re-register the SW pipeline after a long screen-off kill without a reload.
+let currentWsUrl: string | null = null;
+
 // ── Serial Command Queue ──────────────────────────────────────────────────────
 // Commands are processed synchronously one at a time.
 // This prevents rapid seek+play sequences from corrupting shared state.
@@ -1076,24 +1080,52 @@ async function handleAudioReady(filename: string, hash: string) {
 
 // ── Visibility Change — Hard Resync on Screen Wake ────────────────────────────
 async function handleScreenWake() {
-  // Tab came back to foreground.
-  // ensureAudioContext() recreates a closed context (Android screen-off + film end).
-  // resumeAudioContext() handles suspended/interrupted states (iOS screen-lock).
+  // Tab came back to foreground after screen unlock.
+  //
+  // On Oppo (Android 16) and other stock-Android devices, a 10-15 minute
+  // screen-off period causes Android to kill the Chrome renderer process
+  // entirely — not just suspend it. When this happens:
+  //   1. The SW's JavaScript context is destroyed (Web Lock released).
+  //   2. navigator.serviceWorker.controller becomes null.
+  //   3. The SW is in a 'redundant' or 'activating' state, not 'activated'.
+  //   4. postMessage() to the old syncSW reference silently drops the message.
+  //
+  // The fix: always check if the SW controller is gone on wake and re-register
+  // the full SW + WebSocket pipeline before attempting a resync. Without this,
+  // sendToSW() drops the sw_hard_resync into a dead reference, the WS never
+  // reconnects, and the UI stays orange/unresponsive until a full page reload.
+
+  // Step 1: Recover AudioContext
   if (audioCtx) {
     ensureAudioContext();
     await resumeAudioContext();
   }
 
-  // Request fresh authoritative state from the server.
-  // This is the ONLY correct way to recover after coming back to foreground:
-  // the server will reply with the current play/pause state and position,
-  // which will be processed by handleShowCommand and restart playback only
-  // if the master is actually still playing. Do NOT use the stale local
-  // masterIsPlaying flag here — it may be wrong if commands were missed
-  // while the screen was off or the context was suspended.
+  // Step 2: Check if the SW controller is still alive.
+  // If it is gone, the SW process was killed — re-register the full pipeline.
+  // This is the critical fix for the 10-15 minute screen-off unresponsive state.
+  const controllerAlive = !!navigator.serviceWorker?.controller;
+  if (!controllerAlive && currentWsUrl) {
+    console.warn('[ScreenWake] SW controller gone — re-registering SW pipeline');
+    // Reset syncSW so sendToSW doesn't use the dead reference
+    syncSW = null;
+    swConnected = false;
+    playPauseBtn.disabled = true;
+    resyncBtn.disabled    = true;
+    setSyncStatus('waiting', 'Reconnecting…');
+    // Re-register will call sw_init → connectWs → sw_connected → setConnectionState(true)
+    registerSyncWorker(currentWsUrl).catch(() => {});
+    // AudioContext keepalive will be restarted after sw_connected fires
+    return;
+  }
+
+  // Step 3: SW is alive — request fresh authoritative state.
+  // The server will reply with the current play/pause state and position.
+  // Do NOT use stale local masterIsPlaying — it may be wrong if commands
+  // were missed while the screen was off.
   sendToSW({ type: 'sw_hard_resync' });
 
-  // If AudioContext is now running, restart the silent keepalive.
+  // Step 4: Restart the silent keepalive if the AudioContext is running.
   // Playback will be restarted by the incoming sync command from the server.
   if (audioCtx?.state === 'running') {
     startSilentKeepalive();
@@ -1151,23 +1183,36 @@ function startSWWatchdog(wsUrl: string) {
   lastSWMessageAt = Date.now();
   swWatchdogTimer = setInterval(() => {
     const silentMs = Date.now() - lastSWMessageAt;
-    // 8 second threshold: Samsung One UI kills the SW within 1-3 seconds of
-    // screen lock. Detecting silence at 8s gives the SW time to reconnect
-    // (1s reconnect timer) and deliver a pong before we escalate, while
-    // still recovering much faster than the old 25s threshold.
+
+    // Primary check: SW controller is gone.
+    // This is the definitive sign that Android killed the renderer process
+    // (common after 10-15 min screen-off on Oppo/stock Android, and after
+    // 1-3 sec on Samsung without Unrestricted battery). When the controller
+    // is null, postMessage() silently drops all messages — the SW will never
+    // reconnect on its own because its JS context is destroyed.
+    if (!navigator.serviceWorker.controller) {
+      console.warn('[Watchdog] SW controller gone — re-registering');
+      lastSWMessageAt = Date.now();
+      syncSW = null;
+      setConnectionState(false);
+      registerSyncWorker(wsUrl).catch(() => {});
+      return;
+    }
+
+    // Secondary check: SW is alive but has gone silent for >8s.
+    // This catches the case where the WS died but the SW process survived
+    // (e.g. NAT timeout, server restart). Send a hard resync to wake it.
     if (silentMs > 8000) {
-      // SW has been silent for >8s — it was likely killed by Android.
-      // Force an immediate reconnect: re-register the SW and reinitialise.
-      console.warn('[Watchdog] SW silent for', silentMs, 'ms — forcing reconnect');
-      lastSWMessageAt = Date.now(); // reset so we don't fire again immediately
+      console.warn('[Watchdog] SW silent for', silentMs, 'ms — forcing resync');
+      lastSWMessageAt = Date.now();
       sendToSW({ type: 'sw_hard_resync' });
-      // If SW is truly dead, re-register it
-      if (!navigator.serviceWorker.controller) {
-        registerSyncWorker(wsUrl).catch(() => {});
-      }
     }
   }, 5000);
 }
+
+// Track whether the SW message listener has been registered to avoid duplicates
+// when registerSyncWorker is called multiple times (e.g. on screen wake re-registration).
+let swMessageListenerRegistered = false;
 
 async function registerSyncWorker(wsUrl: string): Promise<void> {
   if (!('serviceWorker' in navigator)) {
@@ -1176,7 +1221,13 @@ async function registerSyncWorker(wsUrl: string): Promise<void> {
     return;
   }
 
-  navigator.serviceWorker.addEventListener('message', handleSWMessage);
+  // Only add the message listener once — re-registration on screen wake must not
+  // add duplicate listeners, which would cause every SW message to be processed
+  // twice (double resyncs, double playback starts, etc.).
+  if (!swMessageListenerRegistered) {
+    navigator.serviceWorker.addEventListener('message', handleSWMessage);
+    swMessageListenerRegistered = true;
+  }
 
   const initSW = (sw: ServiceWorker) => {
     syncSW = sw;
@@ -1382,6 +1433,7 @@ async function joinShow() {
 
     // 6. Connect Service Worker WebSocket
     const wsUrl = serverBaseUrl.replace(/^http/, 'ws') + `/api/show/${showId}/ws`;
+    currentWsUrl = wsUrl; // store for re-registration after long screen-off kill
     await registerSyncWorker(wsUrl);
     setSyncStatus('syncing', 'Syncing clock…');
     // Start the background sync heartbeat that keeps the device in sync
