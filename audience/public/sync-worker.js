@@ -168,6 +168,7 @@ function broadcastCommand(msg) {
     serverTs,
     masterTs:     msg.masterTs  || 0,
     audioFile:    msg.audioFile || null,
+    audioHash:    msg.audioHash || null,  // forwarded so main thread can detect a new audio file
     receivedAt,
     clockOffsetMs,
   });

@@ -223,6 +223,7 @@ export class ShowRoom {
           masterTs:  this.showState.masterTs,
           serverTs:  now,
           audioFile: this.showState.audioFile,
+          audioHash: this.showState.audioHash,  // included so devices can detect a new file on reconnect
         }));
         break;
       }
@@ -318,6 +319,7 @@ export class ShowRoom {
       masterTs: this.showState.masterTs,
       serverTs,
       audioFile: this.showState.audioFile,
+      audioHash: this.showState.audioHash,  // allows devices to detect a new file without a separate audio_ready event
     });
 
     for (const ws of this.state.getWebSockets()) {

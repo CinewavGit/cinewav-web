@@ -1131,6 +1131,18 @@ function handleSWMessage(event: MessageEvent) {
       break;
 
     case 'sw_command': {
+      // If the server reports a different audioHash, trigger an automatic
+      // re-download before processing the playback command. This covers the
+      // case where the master uploaded a new file while the device was offline
+      // (missed the audio_ready WebSocket event) or when the device joins a
+      // show that already has a different audio file than what is cached.
+      if (msg.audioHash && showId) {
+        loadAudio(showId).then(existing => {
+          if (existing && existing.hash !== msg.audioHash && msg.audioFile) {
+            handleAudioReady(msg.audioFile, msg.audioHash);
+          }
+        }).catch(() => {});
+      }
       const cmd: ShowCommand = {
         action:        msg.action,
         position:      msg.position,
@@ -1156,16 +1168,29 @@ function handleSWMessage(event: MessageEvent) {
 async function handleAudioReady(filename: string, hash: string) {
   const existing = await loadAudio(showId);
   if (existing?.hash === hash) return;
+
+  // Stop any currently-playing audio before replacing the buffer.
+  // Without this the old audio keeps playing underneath the new file.
+  stopPlayback();
+  pendingPlaybackPos = null;
+
   setSyncStatus('syncing', 'Downloading audio…');
   trackName.textContent = 'Downloading audio…';
   try {
     const buf = await downloadAudioFile(`${serverBaseUrl}/api/show/${showId}/audio`, filename);
     await saveAudio(showId, filename, buf, hash);
     await initAudio(buf);
+    // Return to the player screen — downloadAudioFile() switches to the
+    // download screen but never switches back.
+    showScreen('player');
     trackName.textContent = filename;
     setupMediaSession(filename);
     setSyncStatus('waiting', 'Audio ready — waiting for show');
+    // Request a fresh sync so the new audio starts at the correct position
+    // if the show is already playing.
+    sendToSW({ type: 'sw_hard_resync' });
   } catch {
+    showScreen('player');
     setSyncStatus('waiting', 'Download failed — retry');
   }
 }
