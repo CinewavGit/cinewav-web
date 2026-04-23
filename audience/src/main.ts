@@ -1591,21 +1591,45 @@ async function joinShow() {
       // Start silent keepalive to keep AudioContext alive on iOS screen lock (FIX 3)
       startSilentKeepalive();
 
-      // Always request a fresh authoritative state from the server after audio is
-      // decoded. This replaces the fragile pendingCommand + state.isPlaying logic:
+      // Fast path: use pendingCommand if one arrived while audio was decoding.
+      // pendingCommand is the buffered 'welcome' from the SW — it is already
+      // available the moment initAudio() returns, so no network round-trip needed.
       //
-      // Problem: initAudio() takes several seconds for large files. During that
-      // time the SW releases the buffered 'welcome' as a sw_command, but
-      // handleShowCommand sees audioBuffer===null and stores it as pendingCommand.
-      // If the master is paused, pendingCommand.action === 'pause' and the old
-      // code fell through without starting playback — leaving the device stuck on
-      // 'Waiting for show to start' forever.
+      // The previous approach (discard pendingCommand + sw_hard_resync) caused a
+      // 20-second delay because sw_hard_resync triggers a new 16-ping burst in the
+      // SW before the reply is sent, and on a slow mobile connection this took
+      // 15-20 seconds.
       //
-      // Fix: discard pendingCommand and ask the server for current state instead.
-      // The server reply will carry the correct play/pause action and position,
-      // and handleShowCommand will process it with audioBuffer now available.
-      pendingCommand = null;
-      sendToSW({ type: 'sw_hard_resync' });
+      // Pause fix: the old code skipped handleShowCommand for pause commands
+      // (it only called startPlayback when state.isPlaying was true). Now we
+      // call handleShowCommand for ALL pendingCommand actions — play, pause, seek.
+      // handleShowCommand correctly sets the UI to 'Paused' for pause commands.
+      //
+      // Fallback: if no pendingCommand arrived (e.g. the SW was still connecting
+      // when initAudio finished), fall back to state.isPlaying from the HTTP
+      // response, or send sw_hard_resync as a last resort.
+      if (pendingCommand) {
+        const cmd = pendingCommand;
+        pendingCommand = null;
+        // Compensate for time elapsed while audio was decoding
+        if (cmd.action === 'play') {
+          const elapsed = (Date.now() - (cmd.receivedAt ?? Date.now())) / 1000;
+          cmd.position += elapsed;
+          masterPosition   = cmd.position;
+          masterPositionAt = Date.now();
+        }
+        enqueueCommand(cmd);
+      } else if (state.isPlaying) {
+        // No pending command but server says playing — start at estimated position
+        const masterPos = getEstimatedMasterPosition();
+        await resumeAudioContext();
+        startPlayback(masterPos);
+        setSyncStatus('synced', 'In sync');
+      } else {
+        // No pending command and server says paused — request fresh state
+        // (this handles the screen-wake reconnect case where state may be stale)
+        sendToSW({ type: 'sw_hard_resync' });
+      }
     }
 
   } catch (err) {
