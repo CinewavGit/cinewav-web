@@ -1028,7 +1028,12 @@ redownloadBtn.addEventListener('click', async () => {
       return;
     }
 
-    // 3. Download the new file
+    // 3. Stop any currently-playing audio before replacing the buffer.
+    //    Without this the old audio keeps playing underneath the new file.
+    stopPlayback();
+    pendingPlaybackPos = null;
+
+    // 4. Download the new file (switches to download screen automatically)
     setSyncStatus('syncing', 'Downloading audio…');
     trackName.textContent = 'Downloading audio…';
     const { saveAudio } = await import('./audioStorage');
@@ -1038,12 +1043,24 @@ redownloadBtn.addEventListener('click', async () => {
     );
     await saveAudio(showId, state.audioFile, buf, state.audioHash || '');
     await initAudio(buf);
+
+    // 5. Return to the player screen — downloadAudioFile() switches to the
+    //    download screen but never switches back; we must do it explicitly here.
+    showScreen('player');
     trackName.textContent = state.audioFile;
     setupMediaSession(state.audioFile);
     setSyncStatus('waiting', 'Audio ready — waiting for show');
+
+    // 6. Request a fresh sync from the server so the new audio starts at the
+    //    correct position if the show is already playing.
+    sendToSW({ type: 'sw_hard_resync' });
+
     redownloadBtn.innerHTML = '&#8635; Force Re-download Audio';
     redownloadBtn.disabled = false;
   } catch (err) {
+    // On error, return to the player screen so the user is not stuck on the
+    // download screen with no way to recover.
+    showScreen('player');
     setSyncStatus('waiting', 'Download failed — retry');
     redownloadBtn.innerHTML = '&#8635; Force Re-download Audio';
     redownloadBtn.disabled = false;
