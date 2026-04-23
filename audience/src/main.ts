@@ -801,17 +801,22 @@ let bgSyncHeartbeatInterval: ReturnType<typeof setInterval> | null = null;
 function startBgSyncHeartbeat() {
   if (bgSyncHeartbeatInterval) return;
   bgSyncHeartbeatInterval = setInterval(() => {
-    // Always send a heartbeat regardless of play/pause state.
-    // Rationale: when the master is paused for a long time, the SW WebSocket
-    // can still be killed by Android (long idle = no pings = NAT timeout or
-    // OS idle detection). The heartbeat keeps the WS alive AND ensures that
-    // when the master eventually hits play, the device is already connected
-    // and receives the play command in real time instead of missing it.
-    // The SW's own 4s keepalive ping handles the WS-level keepalive, but
-    // this main-thread heartbeat also catches the case where the SW itself
-    // was killed and needs to be woken up via a message.
+    // Send a heartbeat every 30 seconds.
+    //
+    // Purpose: wake up the SW if Android killed it while the screen was off,
+    // and request a fresh server position so the device snaps back into sync
+    // after a reconnect.
+    //
+    // Why 30s (not 5s):
+    // sw_hard_resync triggers startBurst() in the SW, which fires 16 pings at
+    // 75ms intervals (1.2s total) and resets burstComplete=false. At 5s intervals
+    // the SW was constantly in burst mode — never settling into the quiet 4s
+    // keepalive. The SW's own 20s WS heartbeat handles protocol-level keepalive
+    // independently. The drift loop (500ms) handles local resync. This heartbeat
+    // only needs to handle the case where the SW was killed and needs waking.
+    // 30s is more than sufficient for that — worst-case recovery gap is 30s.
     sendToSW({ type: 'sw_hard_resync' });
-  }, 5000);
+  }, 30000);
 }
 
 function stopBgSyncHeartbeat() {
