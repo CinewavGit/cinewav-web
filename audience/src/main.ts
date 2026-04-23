@@ -283,7 +283,23 @@ async function downloadAudioFile(url: string, filename: string): Promise<ArrayBu
   showScreen('download');
   downloadFilename.textContent = filename;
 
-  const response = await fetch(url);
+  // Bypass ALL cache layers — browser HTTP cache, Service Worker fetch interception,
+  // and Cloudflare edge cache — so a re-download always fetches the current file
+  // from R2 rather than a stale cached copy.
+  //
+  // Three mechanisms used together:
+  //  1. cache: 'no-store'  — tells the browser not to read from or write to its
+  //     HTTP cache for this request. This also prevents the SW fetch handler
+  //     from serving a cached response via event.respondWith(fetch(request))
+  //     because the underlying fetch itself bypasses the cache.
+  //  2. ?_cb=<timestamp>  — cache-busting query parameter that makes the URL
+  //     unique on every download, defeating any URL-keyed cache (CDN, SW cache
+  //     storage, browser disk cache) that ignores Cache-Control headers.
+  //  3. Cache-Control: no-cache header on the R2 response is also changed to
+  //     'no-store' (see worker/src/index.ts) so Cloudflare's edge does not
+  //     serve a stale copy to subsequent requests.
+  const bustUrl = `${url}?_cb=${Date.now()}`;
+  const response = await fetch(bustUrl, { cache: 'no-store' });
   if (!response.ok) throw new Error(`Download failed: ${response.status}`);
 
   const total  = parseInt(response.headers.get('Content-Length') || '0', 10);

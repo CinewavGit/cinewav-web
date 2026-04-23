@@ -118,7 +118,12 @@ export default {
           headers: {
             'Content-Type': object.httpMetadata?.contentType || 'audio/mpeg',
             'Content-Length': String(object.size),
-            'Cache-Control': 'public, max-age=86400',
+            // no-store: prevent Cloudflare edge and browser HTTP cache from
+            // serving a stale copy when the master uploads a new audio file.
+            // The audience app caches the file in IndexedDB (keyed by SHA-256
+            // hash) and handles its own cache invalidation — HTTP caching here
+            // only causes stale-file problems.
+            'Cache-Control': 'no-store',
             'X-Audio-Filename': filename,
             'X-Audio-Hash': hash,
             ...cors,

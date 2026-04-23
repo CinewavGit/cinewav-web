@@ -374,9 +374,25 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// ── Fetch handler (pass-through — Vite PWA handles caching) ──────────────────
+// ── Fetch handler ────────────────────────────────────────────────────────────────────
 self.addEventListener('fetch', (event) => {
-  // Let the Vite-generated service worker handle caching.
-  // We only handle the sync logic here.
+  const url = event.request.url;
+
+  // API requests (audio download, state, WebSocket upgrade) must NEVER be
+  // served from any SW or browser cache. Pass them straight to the network
+  // with cache: 'no-store' so the browser does not read from its HTTP cache
+  // and the SW does not intercept with a cached response.
+  //
+  // This is the critical fix for the 0→100% instant "download" that delivers
+  // the old 1.2 MB file: the SW was calling fetch(event.request) which used
+  // the browser's default cache mode ('default'), serving the cached response
+  // from the previous download instead of fetching from R2.
+  if (url.includes('/api/')) {
+    event.respondWith(fetch(event.request, { cache: 'no-store' }));
+    return;
+  }
+
+  // For all other requests (app shell, JS, CSS, icons) pass through normally.
+  // The Vite PWA plugin handles precaching of static assets separately.
   event.respondWith(fetch(event.request));
 });
