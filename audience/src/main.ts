@@ -1011,9 +1011,28 @@ function handleShowCommand(cmd: ShowCommand) {
       pendingPlaybackPos = null;
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
       ensureAudioContext();
-      resumeAudioContext().catch(() => {});
-      startPlayback(cmd.position);
-      setSyncStatus('synced', 'In sync');
+      if (audioCtx && audioCtx.state === 'running') {
+        // AudioContext is already running — start immediately.
+        startPlayback(cmd.position);
+        setSyncStatus('synced', 'In sync');
+      } else {
+        // AudioContext is suspended (common on Android when the gesture window
+        // expired during the async audio download). Set pendingPlaybackPos so
+        // the statechange listener fires startPlayback() the moment the context
+        // actually resumes. resumeAudioContext() triggers the resume attempt.
+        pendingPlaybackPos = cmd.position;
+        setSyncStatus('syncing', 'Starting audio…');
+        resumeAudioContext().then(() => {
+          // If statechange already fired and cleared pendingPlaybackPos, do nothing.
+          // If the context is now running but statechange hasn't fired yet, start now.
+          if (pendingPlaybackPos !== null && audioCtx && audioCtx.state === 'running') {
+            const pos = pendingPlaybackPos;
+            pendingPlaybackPos = null;
+            startPlayback(pos);
+            setSyncStatus('synced', 'In sync');
+          }
+        }).catch(() => {});
+      }
       break;
     }
     case 'pause': {
@@ -1029,9 +1048,21 @@ function handleShowCommand(cmd: ShowCommand) {
       playStartPos = cmd.position;
       if (masterIsPlaying) {
         ensureAudioContext();
-        resumeAudioContext().catch(() => {});
-        startPlayback(cmd.position);
-        setSyncStatus('synced', 'In sync');
+        if (audioCtx && audioCtx.state === 'running') {
+          startPlayback(cmd.position);
+          setSyncStatus('synced', 'In sync');
+        } else {
+          pendingPlaybackPos = cmd.position;
+          setSyncStatus('syncing', 'Starting audio…');
+          resumeAudioContext().then(() => {
+            if (pendingPlaybackPos !== null && audioCtx && audioCtx.state === 'running') {
+              const pos = pendingPlaybackPos;
+              pendingPlaybackPos = null;
+              startPlayback(pos);
+              setSyncStatus('synced', 'In sync');
+            }
+          }).catch(() => {});
+        }
       } else {
         setSyncStatus('synced', 'Paused');
       }
@@ -1698,8 +1729,15 @@ async function joinShow() {
         // No pending command but server says playing — start at estimated position
         const masterPos = getEstimatedMasterPosition();
         await resumeAudioContext();
-        startPlayback(masterPos);
-        setSyncStatus('synced', 'In sync');
+        if (audioCtx && audioCtx.state === 'running') {
+          startPlayback(masterPos);
+          setSyncStatus('synced', 'In sync');
+        } else {
+          // AudioContext still suspended after resume attempt (Android gesture expired).
+          // Set pendingPlaybackPos so statechange fires startPlayback() when it resumes.
+          pendingPlaybackPos = masterPos;
+          setSyncStatus('syncing', 'Starting audio…');
+        }
       } else {
         // No pending command and server says paused — request fresh state
         // (this handles the screen-wake reconnect case where state may be stale)
