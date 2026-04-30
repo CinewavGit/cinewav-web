@@ -83,6 +83,7 @@ let audioBuffer:     AudioBuffer  | null          = null;
 let sourceNode:      AudioBufferSourceNode | null = null;
 let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepalive
 let androidKeepalive: HTMLAudioElement | null = null;        // Android AudioManager keepalive
+let androidKeepaliveSource: MediaElementAudioSourceNode | null = null; // createMediaElementSource bridge
 let isPlaying         = false;
 let playStartWallTime = 0;  // Date.now() when playback started (wall clock, not audio clock)
 let playStartPos      = 0;  // audio position (seconds) when playback started
@@ -510,36 +511,94 @@ function startSilentKeepalive() {
 
 /**
  * Start the Android HTMLAudioElement keepalive.
- * Plays silent.mp3 in a loop to register with Android's AudioManager.
- * This prevents Samsung One UI from killing the Chrome renderer on screen lock.
+ *
+ * KEY CHANGE (Option A): After play() resolves, we pipe the keepalive element
+ * through the AudioContext via createMediaElementSource(). This does two things:
+ *
+ * 1. Forces Chrome to keep the AudioContext running as long as the element plays.
+ *    Previously the HTMLAudioElement was disconnected from the AudioContext graph,
+ *    so Android's AudioManager could not see it as a real media session.
+ *
+ * 2. Registers a proper MediaElementAudioSourceNode with Android's AudioManager.
+ *    Android now sees a real HTMLAudioElement connected to a real AudioContext —
+ *    the same pattern Spotify/YouTube Music/FPlayWeb use — and grants full audio
+ *    focus, preventing Samsung/Oppo/ZTE battery managers from freezing the renderer.
+ *
+ * The GainNode is set to 0 so no actual sound is output (the real show audio
+ * comes from AudioBufferSourceNode as before). The keepalive element itself
+ * plays silent60.mp3 at volume 0.001 as a belt-and-suspenders measure.
+ *
  * Safe to call multiple times — idempotent.
  */
 function startAndroidKeepalive() {
   if (androidKeepalive) return; // already running
+  if (!audioCtx || audioCtx.state === 'closed') return; // no context yet
+
   const audio = new Audio('/silent60.mp3');
   audio.crossOrigin = 'anonymous';
   audio.preload = 'auto';
   audio.playsInline = true;
   audio.loop   = true;
-  audio.volume = 0.01; // effectively silent but non-zero to avoid OS optimisation
-  audio.muted = true;
-  audio.play().then(() => { audio.muted = false; }).catch(() => {
+  audio.volume = 0.001;
+  audio.muted  = true;
+
+  // Set mediaSession metadata so Android's AudioManager identifies this as a
+  // legitimate media session (same as Spotify/YouTube Music).
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'Cinewav',
+      artist: 'Live Event Audio',
+      album: 'Cinewav'
+    });
+  }
+
+  audio.play().then(() => {
+    // Unmute after play() resolves to bypass strict Android autoplay policies.
+    audio.muted = false;
+
+    // ── createMediaElementSource() bridge ────────────────────────────────────
+    // Connect the keepalive element into the AudioContext graph. This is the
+    // critical step: it tells Android's AudioManager that this AudioContext
+    // owns a real HTMLAudioElement media session. Without this, the AudioContext
+    // (and the show audio inside it) is invisible to the OS and gets killed.
+    //
+    // We guard against the AudioContext being closed/replaced between the
+    // play() call and this .then() callback (e.g. rapid seek during startup).
+    if (audioCtx && audioCtx.state !== 'closed' && !androidKeepaliveSource) {
+      try {
+        const ctx = audioCtx;
+        const mediaSource = ctx.createMediaElementSource(audio);
+        // Route through a silent GainNode — we do not want to hear the
+        // silent60.mp3 file through the speakers, only through the OS.
+        const silentGain = ctx.createGain();
+        silentGain.gain.value = 0;
+        mediaSource.connect(silentGain);
+        silentGain.connect(ctx.destination);
+        androidKeepaliveSource = mediaSource;
+      } catch (e) {
+        // createMediaElementSource can throw if the element is already
+        // connected to a different AudioContext. Log and continue — the
+        // HTMLAudioElement alone is still better than nothing.
+        console.warn('[Cinewav] createMediaElementSource failed:', e);
+      }
+    }
+  }).catch(() => {
     // Autoplay blocked — this should not happen here because we are called
     // from within startPlayback() which is triggered by a user gesture or
     // an incoming sync command after the user has already interacted.
     // If it does fail, the AudioBufferSourceNode keepalive still works for iOS.
   });
-  if ('mediaSession' in navigator) {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: 'Cinewav Sync',
-      artist: 'Cinewav',
-      album: 'Live Event'
-    });
-  }
+
   androidKeepalive = audio;
 }
 
 function stopAndroidKeepalive() {
+  // Disconnect the createMediaElementSource bridge first to avoid
+  // "already connected to a different AudioContext" errors on restart.
+  if (androidKeepaliveSource) {
+    try { androidKeepaliveSource.disconnect(); } catch { /* already disconnected */ }
+    androidKeepaliveSource = null;
+  }
   if (!androidKeepalive) return;
   androidKeepalive.pause();
   androidKeepalive.src = '';
