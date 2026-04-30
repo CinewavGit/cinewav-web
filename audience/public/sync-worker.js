@@ -304,6 +304,16 @@ self.addEventListener('message', (event) => {
       // resync request is not silently dropped. The resync will be sent
       // automatically after the welcome is flushed (see pong handler above).
       if (ws && ws.readyState === WebSocket.OPEN) {
+        // If a welcome is buffered and we already have enough offset samples,
+        // flush it immediately instead of waiting for the next pong.
+        // This fixes the race where sw_hard_resync arrives before the burst
+        // completes on reconnect, leaving pendingWelcome buffered indefinitely
+        // and the main thread stuck in 'Syncing clock...' forever.
+        if (pendingWelcome && offsetHistory.length >= MIN_PINGS_BEFORE_WELCOME) {
+          const welcome = pendingWelcome;
+          pendingWelcome = null;
+          broadcastCommand(welcome);
+        }
         startBurst();
         ws.send(JSON.stringify({ type: 'resync' }));
       } else {

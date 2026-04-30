@@ -220,6 +220,40 @@ function showError(msg: string) {
   showScreen('error');
 }
 
+// ── Syncing Timeout ─────────────────────────────────────────────────────────
+// If the UI stays in 'syncing' state for more than 6 seconds without a
+// sw_command arriving (e.g. the welcome message was lost due to a race in the
+// SW), automatically send another sw_hard_resync to break the stuck state.
+// This is the belt-and-suspenders fix for the 'permanent flashing syncing dot'
+// bug on Android after a connection loss.
+let syncingTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+function startSyncingTimeout() {
+  if (syncingTimeoutTimer) clearTimeout(syncingTimeoutTimer);
+  syncingTimeoutTimer = setTimeout(() => {
+    syncingTimeoutTimer = null;
+    // Only retry if still stuck in syncing — if a command arrived it would
+    // have set the status to 'synced' or 'waiting', clearing this state.
+    const currentText = syncStatusText.textContent || '';
+    if (currentText.includes('Syncing') || currentText.includes('Starting audio')) {
+      console.warn('[Cinewav] Stuck in syncing state — forcing resync');
+      if (currentWsUrl && (!swConnected || !navigator.serviceWorker?.controller)) {
+        syncSW = null;
+        registerSyncWorker(currentWsUrl).catch(() => {});
+      } else {
+        sendToSW({ type: 'sw_hard_resync' });
+      }
+      // Restart the timeout so we keep retrying every 6s until resolved.
+      startSyncingTimeout();
+    }
+  }, 6000);
+}
+function clearSyncingTimeout() {
+  if (syncingTimeoutTimer) {
+    clearTimeout(syncingTimeoutTimer);
+    syncingTimeoutTimer = null;
+  }
+}
+
 type SyncStatusType = 'waiting' | 'syncing' | 'synced' | 'drifted';
 function setSyncStatus(status: SyncStatusType, label: string) {
   syncDot.className = `status-dot ${
@@ -228,13 +262,13 @@ function setSyncStatus(status: SyncStatusType, label: string) {
     status === 'syncing' ? 'syncing' : ''
   }`;
   syncStatusText.textContent = label;
+  // Clear the syncing timeout whenever we reach a resolved state.
+  // This prevents the auto-retry from firing after the device has already synced.
+  if (status === 'synced' || status === 'waiting') {
+    clearSyncingTimeout();
+  }
 }
 
-// ── Connection State Gate ────────────────────────────────────────────────────
-// Centralises all UI changes that depend on whether the WebSocket is live.
-// When disconnected: play/resync buttons are disabled, status shows reconnecting.
-// When reconnected: buttons re-enable and an immediate server resync is requested
-// so the device snaps to the authoritative master state without any local guessing.
 function setConnectionState(connected: boolean) {
   swConnected = connected;
   if (!connected) {
@@ -254,6 +288,8 @@ function setConnectionState(connected: boolean) {
     // Do NOT use stale local masterIsPlaying/masterPosition — they may be
     // completely wrong after a long pause or missed commands.
     sendToSW({ type: 'sw_hard_resync' });
+    // Start the syncing timeout so we auto-retry if the sw_command is lost.
+    startSyncingTimeout();
   }
 }
 
@@ -984,12 +1020,22 @@ playPauseBtn.addEventListener('click', () => {
     // Starting playback requires a live connection so we get the authoritative
     // position from the server. Never start from a stale local estimate.
     if (!swConnected) {
+      // Actively force a reconnect — do not just show a status and return.
+      // The watchdog fires every 5s but the user tapping Play expects an
+      // immediate response. Re-register the SW pipeline right now.
       setSyncStatus('waiting', 'Reconnecting…');
+      if (currentWsUrl) {
+        syncSW = null;
+        registerSyncWorker(currentWsUrl).catch(() => {});
+      } else {
+        sendToSW({ type: 'sw_hard_resync' });
+      }
       return;
     }
     // Request fresh state from server; the incoming sw_command will start playback.
     sendToSW({ type: 'sw_hard_resync' });
     setSyncStatus('syncing', 'Syncing…');
+    startSyncingTimeout();
   }
 });
 
@@ -1100,9 +1146,14 @@ function doManualResync() {
 
 resyncBtn.addEventListener('click', () => {
   if (!swConnected) {
-    // Not connected — request reconnect and show status; do not use stale local position.
+    // Actively force a reconnect — same as the play button.
     setSyncStatus('waiting', 'Reconnecting…');
-    sendToSW({ type: 'sw_hard_resync' });
+    if (currentWsUrl) {
+      syncSW = null;
+      registerSyncWorker(currentWsUrl).catch(() => {});
+    } else {
+      sendToSW({ type: 'sw_hard_resync' });
+    }
     return;
   }
   sendToSW({ type: 'sw_hard_resync' });
@@ -1111,6 +1162,7 @@ resyncBtn.addEventListener('click', () => {
   doManualResync();
   resyncBtn.textContent = '✓ Synced!';
   setTimeout(() => { resyncBtn.innerHTML = '&#8635; Resync Now'; }, 1500);
+  startSyncingTimeout();
 });
 
 // ── Force Re-download ───────────────────────────────────────────────────────────
@@ -1229,6 +1281,10 @@ function handleSWMessage(event: MessageEvent) {
       // because even the first connection needs the current server state.
       setConnectionState(true);
       setSyncStatus('syncing', 'Syncing clock…');
+      // setConnectionState already calls startSyncingTimeout via sendToSW resync path,
+      // but setSyncStatus('syncing') above would have cleared it if status was 'waiting'.
+      // Restart it explicitly here so the 6s auto-retry is active from this point.
+      startSyncingTimeout();
       break;
 
     case 'sw_disconnected':
