@@ -309,10 +309,24 @@ self.addEventListener('message', (event) => {
 
     case 'sw_hard_resync': {
       // Main thread requests immediate position — send a ping burst
-      // AND request a fresh sync message from the server.
-      // If the WebSocket is not open, force an immediate reconnect so the
-      // resync request is not silently dropped. The resync will be sent
-      // automatically after the welcome is flushed (see pong handler above).
+      // AND (if the clock is already stable) request a fresh sync message
+      // from the server.
+      //
+      // IMPORTANT: Do NOT send a server resync during an active burst.
+      // During a burst, clockOffsetMs is still settling (median of a mix of
+      // old and new samples). Each pong shifts the median slightly, which
+      // changes the transit-corrected position in broadcastCommand(). If we
+      // also send a server resync, the server replies with a fresh 'play'
+      // command, broadcastCommand() applies the jittering clockOffsetMs, and
+      // main.ts calls startPlayback() → audioElement.currentTime = ... on
+      // every pong. On iOS Safari, setting currentTime causes a brief audio
+      // buffer flush → audible volume dip. On Android it is less pronounced.
+      //
+      // Fix: only send the server resync when burstComplete=true (clock is
+      // stable). The bgSyncHeartbeat fires every 15s — by that time the burst
+      // from the previous resync has long since completed. The only time
+      // burstComplete=false here is during the initial connection burst or
+      // an explicit reconnect, where a server resync IS needed.
       if (ws && ws.readyState === WebSocket.OPEN) {
         // If a welcome is buffered and we already have enough offset samples,
         // flush it immediately instead of waiting for the next pong.
@@ -325,7 +339,13 @@ self.addEventListener('message', (event) => {
           broadcastCommand(welcome);
         }
         startBurst();
-        ws.send(JSON.stringify({ type: 'resync' }));
+        // Only request a server resync when the clock is already stable.
+        // During an active burst (burstComplete=false), the clock is settling
+        // and a server reply would produce a jittering corrected position that
+        // triggers repeated audioElement.currentTime seeks → audible dip.
+        if (burstComplete) {
+          ws.send(JSON.stringify({ type: 'resync' }));
+        }
       } else {
         // Socket is closed or closing — cancel any pending reconnect timer
         // and reconnect immediately so recovery is instant.

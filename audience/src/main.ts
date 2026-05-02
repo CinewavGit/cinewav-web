@@ -1227,6 +1227,24 @@ function handleShowCommand(cmd: ShowCommand) {
       // while playing (e.g. bgSyncHeartbeat → server play-sync). Skip bell.
       // If isPlaying is false this is a genuine paused→playing transition.
       const alreadyPlaying = isPlaying;
+
+      // AUDIO DIP FIX: if already playing and the incoming position is within
+      // the hard-seek threshold (500ms), do NOT call startPlayback().
+      // startPlayback() calls audioElement.currentTime = ... which on iOS Safari
+      // causes a brief audio buffer flush → audible volume dip.
+      // The drift loop already handles corrections within 500ms via rate nudging.
+      // Only hard-seek if the position is genuinely far off (>500ms), which
+      // indicates a real resync need (e.g. after reconnect or long screen-off).
+      if (alreadyPlaying && audioCtx && audioCtx.state === 'running') {
+        const positionDiffMs = Math.abs((cmd.position - getCurrentPosition()) * 1000);
+        if (positionDiffMs < 500) {
+          // Position is close enough — update masterPosition so drift loop
+          // has the fresh server reference, but do NOT seek.
+          setSyncStatus('synced', 'In sync');
+          break;
+        }
+      }
+
       if (audioCtx && audioCtx.state === 'running') {
         // AudioContext is already running — start immediately.
         startPlayback(cmd.position, alreadyPlaying);
