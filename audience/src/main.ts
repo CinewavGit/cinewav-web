@@ -897,39 +897,58 @@ function startUILoop() {
   }, 250);
 }
 
-// ── Drift Detection Loop ──────────────────────────────────────────────────────
-const DRIFT_CHECK_MS   = 500;
-const RESYNC_AHEAD_MS  = 150;
-const RESYNC_BEHIND_MS = 300;
-
+//// ── Drift Detection Loop ──────────────────────────────────────────────────────
+// Drift correction uses two strategies:
+//
+// 1. RATE NUDGE (small drift 50–500ms): adjust audioElement.playbackRate
+//    slightly to let the audio catch up or slow down without interrupting
+//    playback. This avoids calling play() repeatedly, which on some Android
+//    devices (Samsung/Oppo) triggers a system notification sound on each call.
+//
+// 2. HARD SEEK (large drift >500ms): call startPlayback() to seek directly
+//    to the correct position. Only used when rate nudging cannot catch up
+//    fast enough (e.g. after a long screen-off disconnect).
+const DRIFT_CHECK_MS        = 500;
+const NUDGE_THRESHOLD_MS    = 50;   // start nudging above this
+const HARD_SEEK_THRESHOLD_MS = 500; // hard seek above this
 function startDriftLoop() {
   if (driftInterval) clearInterval(driftInterval);
   driftInterval = setInterval(() => {
     if (!isPlaying || !masterIsPlaying) return;
-
     const actualPos   = getCurrentPosition();
     const expectedPos = getEstimatedMasterPosition() + (manualOffsetMs / 1000);
     driftMs = (actualPos - expectedPos) * 1000;
-
     statDrift.textContent = `${driftMs >= 0 ? '+' : ''}${Math.round(driftMs)}ms`;
     const abs = Math.abs(driftMs);
     if      (abs < 50)  setSyncStatus('synced',  'In sync');
     else if (abs < 150) setSyncStatus('syncing', `${Math.round(abs)}ms drift`);
     else                setSyncStatus('drifted', `${Math.round(abs)}ms drift`);
-
-    // FIX 2: require 2 consecutive out-of-range readings before auto-resync
-    if (driftMs > RESYNC_AHEAD_MS || driftMs < -RESYNC_BEHIND_MS) {
+    if (abs >= HARD_SEEK_THRESHOLD_MS) {
+      // Large drift: hard seek to correct position immediately.
       driftOutOfRangeCount++;
       if (driftOutOfRangeCount >= DRIFT_CONFIRM_COUNT) {
         driftOutOfRangeCount = 0;
         resyncs++;
         statResyncs.textContent = String(resyncs);
+        if (audioElement) audioElement.playbackRate = 1.0; // reset rate before seek
         const targetRaw = getEstimatedMasterPosition();
         startPlayback(targetRaw);
         setSyncStatus('synced', 'In sync');
       }
-    } else {
+    } else if (abs >= NUDGE_THRESHOLD_MS && audioElement) {
+      // Small drift: nudge playback rate to gently correct without seeking.
+      // Behind (positive driftMs = we are ahead of master): slow down slightly.
+      // Ahead (negative driftMs = we are behind master): speed up slightly.
+      // Rate range: 0.97 – 1.03 (3% max nudge, inaudible to most listeners).
       driftOutOfRangeCount = 0;
+      const nudge = driftMs > 0 ? -0.02 : 0.02; // slow down if ahead, speed up if behind
+      audioElement.playbackRate = Math.max(0.97, Math.min(1.03, 1.0 + nudge));
+    } else {
+      // In sync: reset rate to normal.
+      driftOutOfRangeCount = 0;
+      if (audioElement && audioElement.playbackRate !== 1.0) {
+        audioElement.playbackRate = 1.0;
+      }
     }
   }, DRIFT_CHECK_MS);
 }
