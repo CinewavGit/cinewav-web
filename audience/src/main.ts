@@ -1229,16 +1229,29 @@ function handleShowCommand(cmd: ShowCommand) {
       const alreadyPlaying = isPlaying;
 
       // AUDIO DIP FIX: if already playing and the incoming position is within
-      // the hard-seek threshold (500ms), do NOT call startPlayback().
+      // acceptable bounds, do NOT call startPlayback().
       // startPlayback() calls audioElement.currentTime = ... which on iOS Safari
       // causes a brief audio buffer flush → audible volume dip.
-      // The drift loop already handles corrections within 500ms via rate nudging.
-      // Only hard-seek if the position is genuinely far off (>500ms), which
-      // indicates a real resync need (e.g. after reconnect or long screen-off).
+      //
+      // Asymmetric thresholds (driftMs = actualPos - expectedPos, so:
+      //   positive driftMs = we are AHEAD of master (playing too far forward)
+      //   negative driftMs = we are BEHIND master (playing too slow/late)
+      //
+      //   Skip hard-seek if: ahead by <150ms  OR  behind by <300ms
+      //   Hard-seek if:      ahead by ≥150ms  OR  behind by ≥300ms
+      //
+      // Being ahead is more noticeable (audience hears audio before the image)
+      // so the ahead threshold is tighter (150ms). Being behind is less
+      // perceptible so we allow up to 300ms before seeking.
+      // The drift loop handles corrections within these bounds via ±3% rate nudge.
       if (alreadyPlaying && audioCtx && audioCtx.state === 'running') {
-        const positionDiffMs = Math.abs((cmd.position - getCurrentPosition()) * 1000);
-        if (positionDiffMs < 500) {
-          // Position is close enough — update masterPosition so drift loop
+        // driftMs: positive = we are ahead of master, negative = behind
+        const driftMs = (getCurrentPosition() - cmd.position) * 1000;
+        const withinBounds = driftMs >= 0
+          ? driftMs < 150   // ahead: tolerate up to 150ms
+          : driftMs > -300; // behind: tolerate up to 300ms
+        if (withinBounds) {
+          // Position is within bounds — update masterPosition so drift loop
           // has the fresh server reference, but do NOT seek.
           setSyncStatus('synced', 'In sync');
           break;
