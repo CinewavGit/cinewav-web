@@ -76,6 +76,7 @@ const ftMinus            = document.getElementById('ft-minus')         as HTMLBu
 const ftPlus             = document.getElementById('ft-plus')          as HTMLButtonElement;
 const ftReset            = document.getElementById('ft-reset')         as HTMLButtonElement;
 const ftValue            = document.getElementById('ft-value')!;
+const tapToStartEl       = document.getElementById('tap-to-start')!;
 
 // ── App State ─────────────────────────────────────────────────────────────────
 let audioCtx:        AudioContext | null          = null;
@@ -385,7 +386,17 @@ async function downloadAudioFile(url: string, filename: string): Promise<ArrayBu
   return buf.buffer;
 }
 
-// ── Audio Engine ──────────────────────────────────────────────────────────────
+// ── Audio Engine ────────────────────────────────────────────
+
+// ── Tap-to-Start Overlay helpers ───────────────────────────────────
+// Defined early so they can be called from attachAudioContextListeners.
+function showTapToStart() {
+  tapToStartEl.classList.add('visible');
+}
+
+function hideTapToStart() {
+  tapToStartEl.classList.remove('visible');
+}
 
 /**
  * Attach the statechange listener to an AudioContext.
@@ -396,6 +407,8 @@ function attachAudioContextListeners(ctx: AudioContext) {
     // Ignore events from stale (replaced) contexts
     if (ctx !== audioCtx) return;
     if (ctx.state === 'running') {
+      // Context is now running — hide the tap-to-start overlay if it was shown.
+      hideTapToStart();
       // Restart silent keepalive on the resumed/new context
       startSilentKeepalive();
       // Context just resumed — only honour a pendingPlaybackPos that was
@@ -1167,7 +1180,10 @@ function updatePlayPauseBtn() {
 }
 
 playPauseBtn.addEventListener('click', () => {
-  if (!audioBuffer) return;
+  // Guard: audio must be loaded (audioElement is the source of truth since
+  // we switched from AudioBufferSourceNode to HTMLAudioElement streaming.
+  // audioBuffer is kept as null for legacy reasons and must NOT be used here).
+  if (!audioElement) return;
   if (isPlaying) {
     // Pausing locally is always allowed — it does not depend on the connection.
     locallyPaused = true;  // suppress incoming play commands from the server
@@ -1176,6 +1192,14 @@ playPauseBtn.addEventListener('click', () => {
     setSyncStatus('synced', 'Paused locally');
   } else {
     locallyPaused = false;  // clear local pause — rejoin the master stream
+    // Resume AudioContext synchronously inside this gesture handler.
+    // On iOS and Android, the AudioContext may be suspended after the gesture
+    // window expired during join, or after a phone call interruption.
+    // Calling resume() here (before any await) satisfies the gesture requirement.
+    ensureAudioContext();
+    if (audioCtx && (audioCtx.state === 'suspended' || (audioCtx.state as string) === 'interrupted')) {
+      audioCtx.resume().catch(() => {});
+    }
     // Starting playback requires a live connection so we get the authoritative
     // position from the server. Never start from a stale local estimate.
     if (!swConnected) {
@@ -1198,9 +1222,13 @@ playPauseBtn.addEventListener('click', () => {
   }
 });
 
-// ── Show Command Handler ─────────────────────────────────────────────────────────────
+/// ── Show Command Handler ─────────────────────────────────────────────────────────
 function handleShowCommand(cmd: ShowCommand) {
-  if (!audioBuffer) {
+  // Guard: audio must be loaded. Use audioElement (HTMLAudioElement streaming)
+  // as the source of truth. audioBuffer is always null (deprecated) and must
+  // NOT be used as a guard here — it caused the Play button to silently do
+  // nothing after pause because the guard always returned early.
+  if (!audioElement) {
     pendingCommand = cmd;
     return;
   }
@@ -2030,19 +2058,28 @@ async function joinShow() {
           masterPositionAt = Date.now();
         }
         enqueueCommand(cmd);
+        // If the AudioContext is still suspended after all the awaits above
+        // (iOS gesture window expired), show the tap-to-start overlay so the
+        // user can resume it with a direct tap. The statechange listener will
+        // fire startPlayback() automatically once the context resumes.
+        if (audioCtx && audioCtx.state !== 'running') {
+          showTapToStart();
+        }
       } else if (state.isPlaying) {
         // No pending command but server says playing — start at estimated position
         const masterPos = getEstimatedMasterPosition();
         await resumeAudioContext();
         if (audioCtx && audioCtx.state === 'running') {
           // joinShow path: first playback start after joining — paused→playing transition.
-        startPlayback(masterPos, false);
+          startPlayback(masterPos, false);
           setSyncStatus('synced', 'In sync');
         } else {
-          // AudioContext still suspended after resume attempt (Android gesture expired).
+          // AudioContext still suspended after resume attempt (iOS/Android gesture expired).
           // Set pendingPlaybackPos so statechange fires startPlayback() when it resumes.
+          // Show tap-to-start overlay so the user can unlock audio with a direct tap.
           pendingPlaybackPos = masterPos;
           setSyncStatus('syncing', 'Starting audio…');
+          showTapToStart();
         }
       } else {
         // No pending command and server says paused — request fresh state
@@ -2112,3 +2149,41 @@ batteryPromptSkip.addEventListener('click', () => dismissAndroidBatteryPrompt(fa
 // Show the prompt on first load for Android devices that haven't dismissed it.
 // We show it on the join screen so the user can act before the show starts.
 showAndroidBatteryPrompt();
+
+// ── Tap-to-Start Overlay (iOS/WebKit AudioContext gesture requirement) ────────────────
+// iOS Safari and Chrome-on-iOS (WebKit) require a direct synchronous user
+// gesture to resume an AudioContext. The joinShow() flow creates and attempts
+// to resume the context on the Join button tap, but several await calls follow
+// (fetch, IndexedDB, download, initAudio). By the time the player screen
+// appears, iOS considers the gesture window expired and the context stays
+// suspended. The sw_command 'play' then sets pendingPlaybackPos and the orange
+// syncing dot stays on indefinitely until the user taps Resync.
+//
+// Fix: show a full-screen overlay on the player screen whenever the
+// AudioContext is suspended. A single tap calls audioCtx.resume()
+// synchronously (direct gesture, no await before it), which fires the
+// statechange event → pendingPlaybackPos is consumed → audio starts.
+//
+// The overlay is shown by showTapToStart() and hidden by hideTapToStart().
+// showTapToStart() is called from two places:
+//   1. After showScreen('player') in joinShow() if context is still suspended.
+//   2. From the statechange handler if context goes suspended/interrupted
+//      while on the player screen (e.g. after a phone call interruption).
+
+tapToStartEl.addEventListener('click', () => {
+  // Resume AudioContext synchronously in the gesture handler.
+  // No await before this — iOS requires the resume() call to be the FIRST
+  // async operation inside the gesture, otherwise the gesture window expires.
+  if (audioCtx && (audioCtx.state === 'suspended' || (audioCtx.state as string) === 'interrupted')) {
+    audioCtx.resume().then(() => {
+      hideTapToStart();
+      // If a play command arrived while suspended, pendingPlaybackPos is set.
+      // The statechange listener will fire startPlayback() automatically.
+      // If not (e.g. master is paused), just hide the overlay.
+    }).catch(() => {
+      hideTapToStart(); // hide anyway — user can tap Resync if needed
+    });
+  } else {
+    hideTapToStart();
+  }
+});

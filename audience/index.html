@@ -679,6 +679,67 @@
     }
     .btn-battery-skip:active { color: var(--text); }
 
+    /* ── Tap-to-Start Overlay ── */
+    /* Shown on iOS/WebKit whenever the AudioContext is suspended after joining.
+       A direct tap resumes the context synchronously (satisfying the gesture
+       requirement) and dismisses the overlay. */
+    #tap-to-start {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 8000;
+      background: rgba(10, 10, 15, 0.92);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      padding: 32px;
+      text-align: center;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #tap-to-start.visible { display: flex; }
+
+    .tap-icon {
+      font-size: 64px;
+      animation: tapPulse 1.5s ease-in-out infinite;
+    }
+    @keyframes tapPulse {
+      0%, 100% { transform: scale(1);   opacity: 1; }
+      50%       { transform: scale(1.1); opacity: 0.7; }
+    }
+
+    .tap-title {
+      font-size: 24px;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: -0.5px;
+    }
+
+    .tap-subtitle {
+      font-size: 15px;
+      color: var(--text-muted);
+      max-width: 280px;
+      line-height: 1.5;
+    }
+
+    .tap-btn {
+      margin-top: 8px;
+      padding: 16px 40px;
+      border: none;
+      border-radius: 14px;
+      background: var(--accent);
+      color: white;
+      font-size: 18px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 4px 24px rgba(42,157,143,0.5);
+      transition: transform 0.1s;
+    }
+    .tap-btn:active { transform: scale(0.96); }
+
     /* ── Update Banner ── */
     #update-banner {
       position: fixed;
@@ -720,6 +781,16 @@
   </style>
 </head>
 <body>
+
+  <!-- ── Tap-to-Start Overlay (iOS/WebKit AudioContext gesture requirement) ── -->
+  <!-- Shown when AudioContext is suspended after joining. Tapping anywhere
+       resumes the context synchronously (direct gesture) and starts audio. -->
+  <div id="tap-to-start" role="button" aria-label="Tap to start audio">
+    <div class="tap-icon">🎶</div>
+    <div class="tap-title">Tap to Start Audio</div>
+    <p class="tap-subtitle">Your browser requires a tap to unlock audio playback.</p>
+    <button class="tap-btn">Start Audio</button>
+  </div>
 
   <!-- ── Android Battery Prompt ── -->
   <div id="android-battery-prompt" role="dialog" aria-modal="true" aria-label="Enable background audio">
