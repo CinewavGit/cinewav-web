@@ -409,7 +409,9 @@ function attachAudioContextListeners(ctx: AudioContext) {
       if (pendingPlaybackPos !== null) {
         const pos = pendingPlaybackPos;
         pendingPlaybackPos = null;
-        startPlayback(pos);
+        // pendingPlaybackPos is set when transitioning from paused/suspended to playing,
+        // so wasAlreadyPlaying=false here — this IS a paused→playing transition.
+        startPlayback(pos, false);
         setSyncStatus('synced', 'In sync');
       }
     }
@@ -766,7 +768,12 @@ function getEstimatedMasterPosition(): number {
  * playStartWallTime so position tracking is correct from the moment
  * the context actually starts playing.
  */
-function startPlayback(rawPosition: number): void {
+function startPlayback(rawPosition: number, _wasAlreadyPlaying = false): void {
+  // _wasAlreadyPlaying: true when this is a seek/resync while already playing.
+  // In that case we skip the MediaSession update so Oppo ColorOS does not ring
+  // the 'Playing media' notification bell on every periodic resync or drift seek.
+  // The caller sets this based on the value of isPlaying BEFORE calling us.
+  const wasAlreadyPlaying = _wasAlreadyPlaying;
   // Stop post-show polling — playback is resuming.
   stopPostShowPolling();
 
@@ -866,11 +873,15 @@ function startPlayback(rawPosition: number): void {
   updatePlayPauseBtn();
   startUILoop();
   startDriftLoop();
-  updateMediaSession();
-  // Set the initial lock-screen scrubber position once at playback start.
-  // We defer this by one tick so getCurrentPosition() reflects the
-  // just-set playStartWallTime rather than the previous stale value.
-  setTimeout(setPositionStateOnce, 50);
+  // Only update the OS MediaSession (and ring the Oppo notification bell) when
+  // playback state actually transitions from paused → playing.
+  // Skipping this on seek/resync-while-playing prevents the 15s heartbeat and
+  // drift-correction hard-seeks from ringing the bell on Oppo ColorOS.
+  if (!wasAlreadyPlaying) {
+    updateMediaSession();
+    // Set the initial lock-screen scrubber position once at playback start.
+    setTimeout(setPositionStateOnce, 50);
+  }
 }
 
 function stopPlayback() {
@@ -940,7 +951,8 @@ function startDriftLoop() {
         statResyncs.textContent = String(resyncs);
         if (audioElement) audioElement.playbackRate = 1.0; // reset rate before seek
         const targetRaw = getEstimatedMasterPosition();
-        startPlayback(targetRaw);
+        // Drift correction while already playing — do NOT ring the Oppo bell.
+        startPlayback(targetRaw, true);
         setSyncStatus('synced', 'In sync');
       }
     } else if (abs >= NUDGE_THRESHOLD_MS && audioElement) {
@@ -1099,15 +1111,16 @@ function setupMediaSession(title: string) {
   });
 
   navigator.mediaSession.setActionHandler('seekto', (details) => {
-    if (details.seekTime != null) startPlayback(details.seekTime);
+    // Seek from lock-screen widget — already playing, no bell.
+    if (details.seekTime != null) startPlayback(details.seekTime, isPlaying);
   });
 
   navigator.mediaSession.setActionHandler('seekbackward', () => {
-    startPlayback(Math.max(0, getCurrentPosition() - 10));
+    startPlayback(Math.max(0, getCurrentPosition() - 10), isPlaying);
   });
 
   navigator.mediaSession.setActionHandler('seekforward', () => {
-    startPlayback(Math.min(audioDuration, getCurrentPosition() + 10));
+    startPlayback(Math.min(audioDuration, getCurrentPosition() + 10), isPlaying);
   });
 }
 
@@ -1210,9 +1223,13 @@ function handleShowCommand(cmd: ShowCommand) {
         break;
       }
       ensureAudioContext();
+      // wasAlreadyPlaying: if isPlaying is already true this is a resync/seek
+      // while playing (e.g. bgSyncHeartbeat → server play-sync). Skip bell.
+      // If isPlaying is false this is a genuine paused→playing transition.
+      const alreadyPlaying = isPlaying;
       if (audioCtx && audioCtx.state === 'running') {
         // AudioContext is already running — start immediately.
-        startPlayback(cmd.position);
+        startPlayback(cmd.position, alreadyPlaying);
         setSyncStatus('synced', 'In sync');
       } else {
         // AudioContext is suspended (common on Android when the gesture window
@@ -1227,7 +1244,8 @@ function handleShowCommand(cmd: ShowCommand) {
           if (pendingPlaybackPos !== null && audioCtx && audioCtx.state === 'running') {
             const pos = pendingPlaybackPos;
             pendingPlaybackPos = null;
-            startPlayback(pos);
+            // pendingPlaybackPos path: was suspended, now running — paused→playing.
+            startPlayback(pos, false);
             setSyncStatus('synced', 'In sync');
           }
         }).catch(() => {});
@@ -1254,7 +1272,8 @@ function handleShowCommand(cmd: ShowCommand) {
       if (masterIsPlaying) {
         ensureAudioContext();
         if (audioCtx && audioCtx.state === 'running') {
-          startPlayback(cmd.position);
+          // seek command: master is seeking while playing — already playing, no bell.
+          startPlayback(cmd.position, isPlaying);
           setSyncStatus('synced', 'In sync');
         } else {
           pendingPlaybackPos = cmd.position;
@@ -1263,7 +1282,7 @@ function handleShowCommand(cmd: ShowCommand) {
             if (pendingPlaybackPos !== null && audioCtx && audioCtx.state === 'running') {
               const pos = pendingPlaybackPos;
               pendingPlaybackPos = null;
-              startPlayback(pos);
+              startPlayback(pos, false); // suspended→running: paused→playing transition
               setSyncStatus('synced', 'In sync');
             }
           }).catch(() => {});
@@ -1293,7 +1312,8 @@ function doManualResync() {
     pendingPlaybackPos = null;
     ensureAudioContext();
     resumeAudioContext().catch(() => {});
-    startPlayback(masterPos);
+    // Manual resync: if already playing this is a seek, not a paused→playing transition.
+    startPlayback(masterPos, isPlaying);
     setSyncStatus('synced', 'Resynced');
   } else {
     stopPlayback();
@@ -1403,7 +1423,8 @@ function applyOffsetChange(oldOffsetMs: number) {
   // getCurrentPosition() returns position WITH old offset baked in.
   // Strip old offset to get raw position; startPlayback re-adds new offset.
   const rawPos = getCurrentPosition() - (oldOffsetMs / 1000);
-  startPlayback(rawPos);
+  // Offset change while playing — already playing, no bell.
+  startPlayback(rawPos, true);
 }
 
 ftMinus.addEventListener('click', () => {
@@ -1983,7 +2004,8 @@ async function joinShow() {
         const masterPos = getEstimatedMasterPosition();
         await resumeAudioContext();
         if (audioCtx && audioCtx.state === 'running') {
-          startPlayback(masterPos);
+          // joinShow path: first playback start after joining — paused→playing transition.
+        startPlayback(masterPos, false);
           setSyncStatus('synced', 'In sync');
         } else {
           // AudioContext still suspended after resume attempt (Android gesture expired).
