@@ -297,6 +297,16 @@ self.addEventListener('message', (event) => {
       break;
     }
 
+    case 'VERSION_CHECK': {
+      // index.html kill script sends this to verify the SW version.
+      // Reply with the version stamp via the provided MessagePort.
+      // If the stamp does not match, the kill script unregisters this SW.
+      if (msg.port) {
+        msg.port.postMessage('2026-05-02-v3');
+      }
+      break;
+    }
+
     case 'sw_hard_resync': {
       // Main thread requests immediate position — send a ping burst
       // AND request a fresh sync message from the server.

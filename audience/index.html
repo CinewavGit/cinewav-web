@@ -2,6 +2,30 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <!-- SW version kill script: runs before anything else.
+       Unregisters any stale Service Worker that does not respond with the
+       correct version stamp. This forces old cached SWs to be replaced
+       immediately on next page load, even if they were intercepting fetches. -->
+  <script>
+    (function() {
+      var EXPECTED = '2026-05-02-v3';
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function(regs) {
+          regs.forEach(function(reg) {
+            var sw = reg.active || reg.waiting || reg.installing;
+            if (!sw) { reg.unregister(); return; }
+            var ch = new MessageChannel();
+            var t = setTimeout(function() { reg.unregister().then(function(){ location.reload(true); }); }, 800);
+            ch.port1.onmessage = function(e) {
+              clearTimeout(t);
+              if (e.data !== EXPECTED) reg.unregister().then(function(){ location.reload(true); });
+            };
+            try { sw.postMessage({ type: 'VERSION_CHECK', port: ch.port2 }, [ch.port2]); } catch(e) { clearTimeout(t); reg.unregister(); }
+          });
+        });
+      }
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
