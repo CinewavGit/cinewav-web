@@ -285,8 +285,9 @@ function setConnectionState(connected: boolean) {
     redownloadBtn.disabled = true;
     setSyncStatus('waiting', 'Reconnecting…');
   } else {
-    // Re-enable controls only if audio is loaded
-    if (audioBuffer) {
+    // Re-enable controls only if audio is loaded (audioElement is the source of truth
+    // since we switched from AudioBufferSourceNode to HTMLAudioElement streaming)
+    if (audioElement) {
       playPauseBtn.disabled  = false;
       resyncBtn.disabled     = false;
       redownloadBtn.disabled = false;
@@ -1008,16 +1009,16 @@ function startBgSyncHeartbeat() {
     // and request a fresh server position so the device snaps back into sync
     // after a reconnect.
     //
-    // Why 30s (not 5s):
+    // Why 15s (not 5s):
     // sw_hard_resync triggers startBurst() in the SW, which fires 16 pings at
     // 75ms intervals (1.2s total) and resets burstComplete=false. At 5s intervals
     // the SW was constantly in burst mode — never settling into the quiet 4s
     // keepalive. The SW's own 20s WS heartbeat handles protocol-level keepalive
     // independently. The drift loop (500ms) handles local resync. This heartbeat
     // only needs to handle the case where the SW was killed and needs waking.
-    // 30s is more than sufficient for that — worst-case recovery gap is 30s.
+    // 15s gives fast recovery (worst-case 15s gap) without flooding the SW.
     sendToSW({ type: 'sw_hard_resync' });
-  }, 30000);
+  }, 15000);
 }
 
 function stopBgSyncHeartbeat() {
@@ -1047,7 +1048,7 @@ function setupMediaSession(title: string) {
   // legitimate media session. The handlers mirror what the play/pause button
   // and resync button already do — they just expose them to the OS.
   navigator.mediaSession.setActionHandler('play', () => {
-    if (!audioBuffer) return;
+    if (!audioElement) return;
     if (!swConnected) {
       // OS lock-screen play button pressed while disconnected.
       // Request reconnect; the server reply will start playback at the correct position.
@@ -1386,6 +1387,20 @@ function handleSWMessage(event: MessageEvent) {
       // setConnectionState(false) disables buttons and shows "Reconnecting…"
       // so the user cannot start independent playback while the WS is down.
       setConnectionState(false);
+      // CRITICAL: pause the audioElement immediately on disconnect.
+      // Without this, the device keeps playing from its last position while
+      // disconnected. When it reconnects, the drift loop compares against a
+      // stale masterPosition and sees zero drift — it never corrects, so the
+      // device plays at the wrong position for the rest of the show.
+      // Pausing here forces a full startPlayback() at the correct server
+      // position when the sw_command arrives after reconnect.
+      if (audioElement && isPlaying) {
+        audioElement.pause();
+        isPlaying = false;
+        waitingOverlay.classList.remove('hidden');
+        albumArt.classList.remove('playing');
+        updatePlayPauseBtn();
+      }
       break;
 
     case 'sw_clock':
@@ -1677,7 +1692,10 @@ async function registerSyncWorker(wsUrl: string): Promise<void> {
       resolve();
     };
 
-    const timeout = setTimeout(() => done(false), 4000);
+    // 10s timeout: Android can take 2-8s to re-activate the SW after the
+    // renderer is unfrozen. 4s was too short and caused premature fallback
+    // to startDirectWebSocket() where syncSW is null and sw_hard_resync is dropped.
+    const timeout = setTimeout(() => done(false), 10000);
 
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       clearTimeout(timeout);
@@ -1763,6 +1781,25 @@ function startDirectWebSocket(wsUrl: string) {
 }
 
 // ── Join Flow ─────────────────────────────────────────────────────────────────
+// Main-thread Web Lock: keeps the Chrome renderer process alive on Android.
+// The SW holds its own lock (acquireKeepAliveLock in sync-worker.js), but
+// Android can freeze the entire renderer (tab + SW) after 5-6 min screen-off
+// if the main thread has no active lock. Holding a lock from the main thread
+// tells Android's battery manager this tab has an active resource claim —
+// the same signal that Spotify's web player uses.
+// Acquired once at join time and held for the session.
+let mainThreadLockHeld = false;
+function acquireMainThreadLock() {
+  if (mainThreadLockHeld) return;
+  if (!('locks' in navigator)) return;
+  mainThreadLockHeld = true;
+  (navigator as Navigator & { locks: { request: Function } }).locks.request(
+    'cinewav-main-keepalive',
+    { mode: 'shared' }, // 'shared' so multiple tabs don't block each other
+    () => new Promise(() => {}) // never resolves — holds lock for session
+  );
+}
+
 async function joinShow() {
   // iOS Safari: the AudioContext MUST be created and resumed synchronously
   // inside a user gesture handler. Any await before this point causes the
@@ -1771,6 +1808,8 @@ async function joinShow() {
   // gesture is still active.
   ensureAudioContext();
   try { audioCtx!.resume(); } catch { /* ignore — will retry in initAudio */ }
+  // Acquire the main-thread Web Lock to prevent Android from freezing the renderer.
+  acquireMainThreadLock();
 
   showId        = joinShowIdInput.value.trim();
   serverBaseUrl = joinServerUrlInput.value.trim().replace(/\/$/, '');
