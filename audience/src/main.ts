@@ -611,31 +611,24 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
  * AudioBufferSourceNode to keep the AudioContext alive.
  */
 function startSilentKeepalive() {
-  if (!audioCtx || audioCtx.state !== 'running') return;
-  // ── AudioBufferSourceNode silent loop (iOS + all platforms) ───────────────
-  // NOTE: With HTMLAudioElement as the primary source, the audioElement itself
-  // keeps the AudioContext alive on iOS. The AudioBufferSourceNode silent loop
-  // is kept as a belt-and-suspenders measure for the case where the audioElement
-  // is paused (e.g. between show end and next play command).
+  // REMOVED: The AudioBufferSourceNode silent loop is no longer needed.
+  //
+  // Previously this created a 1-second looping silent AudioBufferSourceNode
+  // to keep the AudioContext alive on iOS screen lock. On some Android devices
+  // (Samsung, Oppo, ZTE) the loop boundary fired a system notification sound
+  // every 1 second — the "constant bell" bug.
+  //
+  // The fix: since we switched to HTMLAudioElement as the primary audio source
+  // (connected via createMediaElementSource()), the audioElement itself keeps
+  // the AudioContext alive on all platforms. The AudioBufferSourceNode loop
+  // is entirely redundant and has been removed.
+  //
+  // The keepaliveNode variable and stoppage logic are kept for safety in case
+  // a node was started before this version deployed.
   if (keepaliveNode) {
     try { keepaliveNode.stop(); } catch { /* already stopped */ }
     keepaliveNode = null;
   }
-  const sampleRate = audioCtx.sampleRate;
-  const silentBuf  = audioCtx.createBuffer(1, sampleRate, sampleRate);
-  const node = audioCtx.createBufferSource();
-  node.buffer = silentBuf;
-  node.loop   = true;
-  node.connect(audioCtx.destination);
-  node.start(0);
-  keepaliveNode = node;
-
-  // NOTE: The separate Android HTMLAudioElement keepalive (startAndroidKeepalive)
-  // is no longer needed. The main audioElement is now the primary audio source
-  // and is already connected to the AudioContext via createMediaElementSource().
-  // Android's AudioManager sees the show audio directly — no separate keepalive
-  // element is required. Running a second HTMLAudioElement caused Android to
-  // classify it as a notification sound, producing constant bell sounds.
 }
 
 /**
