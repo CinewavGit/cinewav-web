@@ -804,14 +804,37 @@ function startPlayback(rawPosition: number): void {
   const clampedMaster  = Math.max(0, Math.min(masterSpacePos, audioDuration - 0.1));
 
   // Seek the HTMLAudioElement to the target position.
-  // HTMLAudioElement.currentTime seek is accurate to ~10ms for MP3 files.
   audioElement.currentTime = clamped;
 
-  // Record wall-clock start time BEFORE play() so position tracking is
-  // correct from the moment the seek completes, even if play() is async.
-  playStartWallTime = Date.now();
+  // Set playStartPos now (master-space, no platformLatencyMs) so the drift
+  // loop has a valid reference immediately. playStartWallTime is set to a
+  // provisional value here and then CORRECTED in the 'playing' event handler
+  // below, which fires when the first audio frame actually reaches the hardware.
+  //
+  // Why this matters: HTMLAudioElement.play() on iOS Safari takes 80–150ms to
+  // decode the first AAC frame and fill the output buffer before audio starts.
+  // If we record Date.now() here, the wall clock runs ahead of the audio by
+  // that decode latency, making the device appear 100ms behind. The 'playing'
+  // event fires at the exact moment audio output begins, giving us a precise
+  // wall-clock anchor.
   playStartPos      = clampedMaster;
+  playStartWallTime = Date.now(); // provisional — corrected by 'playing' event
   isPlaying         = true;
+
+  // 'playing' event: fired when audio actually starts producing output.
+  // Snap playStartWallTime to this moment to eliminate the decode latency gap.
+  // We use { once: true } so the handler auto-removes after the first fire.
+  audioElement.addEventListener('playing', () => {
+    if (!isPlaying) return; // guard: stopPlayback() may have been called
+    // Recalculate the correct wall-clock anchor:
+    // at this moment, audioElement.currentTime is the actual playhead position.
+    // playStartPos is the master-space position we targeted.
+    // The difference between them (after accounting for platformLatencyMs) is
+    // the decode latency we need to absorb.
+    const actualPos = audioElement!.currentTime - (platformLatencyMs / 1000);
+    const delta     = actualPos - clampedMaster; // how far ahead the element seeked
+    playStartWallTime = Date.now() - (delta * 1000);
+  }, { once: true });
 
   // Resume AudioContext if needed, then play.
   const doPlay = () => {
