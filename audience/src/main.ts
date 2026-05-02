@@ -79,9 +79,14 @@ const ftValue            = document.getElementById('ft-value')!;
 
 // ── App State ─────────────────────────────────────────────────────────────────
 let audioCtx:        AudioContext | null          = null;
-let audioBuffer:     AudioBuffer  | null          = null;
-let sourceNode:      AudioBufferSourceNode | null = null;
-let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepalive
+// Primary playback engine: HTMLAudioElement + createMediaElementSource.
+// Replaces AudioBufferSourceNode to avoid decoding the entire file into RAM
+// (a 2-hour stereo 44.1 kHz file = ~1.3 GB PCM — exceeds iOS Safari's limit).
+// The browser streams the MP3 from a Blob URL, decoding only what it needs.
+let audioElement:    HTMLAudioElement | null       = null;
+let audioBlobUrl:    string | null                 = null;  // revoked on new load
+let audioMediaSource: MediaElementAudioSourceNode | null = null; // Web Audio graph node
+let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepalive (iOS)
 let androidKeepalive: HTMLAudioElement | null = null;        // Android AudioManager keepalive
 let androidKeepaliveSource: MediaElementAudioSourceNode | null = null; // createMediaElementSource bridge
 let isPlaying         = false;
@@ -117,8 +122,10 @@ let pendingCommand: ShowCommand | null = null;
 // Pending playback start deferred until AudioContext resumes
 let pendingPlaybackPos: number | null = null;
 
-// Raw audio ArrayBuffer kept in memory so we can re-decode if AudioContext is closed
-let rawAudioData: ArrayBuffer | null = null;
+// audioBuffer is no longer used (replaced by HTMLAudioElement streaming).
+// Kept as null so any legacy references compile without error.
+let audioBuffer: AudioBuffer | null = null;  // @deprecated — not used
+let rawAudioData: ArrayBuffer | null = null; // @deprecated — not used
 
 // Platform output latency in ms (non-zero on Android with latencyHint:'playback').
 // Measured from audioCtx.outputLatency + audioCtx.baseLatency after context creation.
@@ -412,10 +419,6 @@ function ensureAudioContext() {
   // Android Chrome closes (not just suspends) the AudioContext when the film
   // ends while the screen is off. A closed context cannot be resumed.
   if (!audioCtx || audioCtx.state === 'closed') {
-    if (sourceNode) {
-      try { sourceNode.stop(); } catch { /* already stopped */ }
-      sourceNode = null;
-    }
     if (keepaliveNode) {
       try { keepaliveNode.stop(); } catch { /* already stopped */ }
       keepaliveNode = null;
@@ -470,12 +473,22 @@ async function resumeAudioContext(): Promise<void> {
 
   if (audioCtx.state === 'closed') {
     ensureAudioContext();
-    // Re-decode audio buffer for the new context if we have the raw data
-    if (rawAudioData && audioCtx) {
+    // HTMLAudioElement streaming: no re-decode needed.
+    // The audioElement Blob URL persists across AudioContext recreation.
+    // Re-connect the mediaSource node to the new context.
+    if (audioElement && audioCtx && audioCtx.state !== 'closed') {
       try {
-        audioBuffer = await audioCtx.decodeAudioData(rawAudioData.slice(0));
-        audioDuration = audioBuffer.duration;
-      } catch { /* decode failed */ }
+        // Disconnect old mediaSource if it exists (from previous context)
+        if (audioMediaSource) {
+          try { audioMediaSource.disconnect(); } catch { /* already disconnected */ }
+          audioMediaSource = null;
+        }
+        const mediaSource = audioCtx.createMediaElementSource(audioElement);
+        mediaSource.connect(audioCtx.destination);
+        audioMediaSource = mediaSource;
+      } catch (e) {
+        console.warn('[Cinewav] Failed to reconnect audioElement to new context:', e);
+      }
     }
     return;
   }
@@ -488,11 +501,79 @@ async function resumeAudioContext(): Promise<void> {
 async function initAudio(arrayBuffer: ArrayBuffer) {
   ensureAudioContext();
   await resumeAudioContext();
-  // Keep a copy of the raw bytes so we can re-decode if the AudioContext is
-  // recreated later (e.g. Android closes it when screen-off + film ends).
-  rawAudioData  = arrayBuffer.slice(0);
-  audioBuffer   = await audioCtx!.decodeAudioData(arrayBuffer.slice(0));
-  audioDuration = audioBuffer.duration;
+
+  // ── HTMLAudioElement streaming (replaces decodeAudioData) ───────────────────────
+  // Revoke previous Blob URL to free memory before creating a new one.
+  if (audioBlobUrl) {
+    URL.revokeObjectURL(audioBlobUrl);
+    audioBlobUrl = null;
+  }
+  // Disconnect previous mediaSource node if it exists.
+  if (audioMediaSource) {
+    try { audioMediaSource.disconnect(); } catch { /* already disconnected */ }
+    audioMediaSource = null;
+  }
+
+  // Create a Blob URL from the ArrayBuffer. The browser streams the MP3 from
+  // this URL, decoding only the frames it needs — no 1.3 GB PCM allocation.
+  const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+  audioBlobUrl = URL.createObjectURL(blob);
+
+  // Create or reuse the HTMLAudioElement.
+  if (!audioElement) {
+    audioElement = new Audio();
+    audioElement.crossOrigin = 'anonymous';
+    audioElement.preload = 'metadata'; // load duration without buffering entire file
+    audioElement.playsInline = true;
+  } else {
+    audioElement.pause();
+  }
+  audioElement.src = audioBlobUrl;
+
+  // Wait for metadata (duration) to be available.
+  await new Promise<void>((resolve) => {
+    if (audioElement!.readyState >= 1) { resolve(); return; }
+    audioElement!.addEventListener('loadedmetadata', () => resolve(), { once: true });
+    audioElement!.addEventListener('error', () => resolve(), { once: true });
+  });
+
+  audioDuration = audioElement.duration || 0;
+  // audioBuffer is no longer used — set to a sentinel so guards like
+  // `if (!audioBuffer) return;` still work correctly.
+  audioBuffer = {} as unknown as AudioBuffer;
+
+  // Connect the HTMLAudioElement into the Web Audio graph.
+  // This is required for:
+  //  1. AudioContext-based effects (GainNode, etc.)
+  //  2. Android AudioManager registration (same as Spotify/YouTube)
+  //  3. Keeping the AudioContext alive on iOS screen lock
+  if (audioCtx && audioCtx.state !== 'closed') {
+    try {
+      const mediaSource = audioCtx.createMediaElementSource(audioElement);
+      mediaSource.connect(audioCtx.destination);
+      audioMediaSource = mediaSource;
+    } catch (e) {
+      // createMediaElementSource throws if the element is already connected.
+      // This can happen on re-init. Safe to ignore — existing connection is fine.
+      console.warn('[Cinewav] createMediaElementSource in initAudio:', e);
+    }
+  }
+
+  // Wire up the onended handler for post-show keepalive.
+  audioElement.onended = () => {
+    if (isPlaying) {
+      isPlaying = false;
+      albumArt.classList.remove('playing');
+      if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
+      if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
+      driftOutOfRangeCount = 0;
+      updatePlayPauseBtn();
+      if (!masterIsPlaying) setSyncStatus('synced', 'Show ended');
+      startSilentKeepalive();
+      startPostShowPolling();
+    }
+  };
+
   pTotalTime.textContent = formatTime(audioDuration);
   playPauseBtn.disabled  = false;
   resyncBtn.disabled     = false;
@@ -521,8 +602,11 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
  */
 function startSilentKeepalive() {
   if (!audioCtx || audioCtx.state !== 'running') return;
-
-  // ── AudioBufferSourceNode (iOS + all platforms) ──────────────────────────
+  // ── AudioBufferSourceNode silent loop (iOS + all platforms) ───────────────
+  // NOTE: With HTMLAudioElement as the primary source, the audioElement itself
+  // keeps the AudioContext alive on iOS. The AudioBufferSourceNode silent loop
+  // is kept as a belt-and-suspenders measure for the case where the audioElement
+  // is paused (e.g. between show end and next play command).
   if (keepaliveNode) {
     try { keepaliveNode.stop(); } catch { /* already stopped */ }
     keepaliveNode = null;
@@ -684,78 +768,61 @@ function startPlayback(rawPosition: number): void {
   // Stop post-show polling — playback is resuming.
   stopPostShowPolling();
 
-  if (!audioCtx || !audioBuffer) return;
+  if (!audioCtx || !audioElement) return;
 
-  // Stop all timers and existing node
+  // Stop all timers
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
   driftOutOfRangeCount = 0;
-
-  const oldNode = sourceNode;
-  sourceNode = null;
-  isPlaying  = false;
-  if (oldNode) {
-    try { oldNode.stop(); } catch { /* already stopped */ }
-    oldNode.disconnect();
-  }
+  isPlaying = false;
 
   // Read outputLatency NOW (not at context creation) — it is only populated
   // after the context is running and has processed its first audio frame.
-  // Reading it at new AudioContext() always returns 0 (context still suspended).
   // On Android with latencyHint:'playback' this is typically 200–350ms.
-  // On iOS it is near-zero. We cache it so rapid seeks don't re-read constantly.
+  // On iOS it is near-zero.
   if (audioCtx.state === 'running') {
     const measuredLatency = Math.round(
       ((audioCtx.outputLatency ?? 0) + (audioCtx.baseLatency ?? 0)) * 1000
     );
-    // Only update if we got a non-zero reading (zero means not yet populated)
     if (measuredLatency > 0) platformLatencyMs = measuredLatency;
   }
 
-  // playStartPos tracks position in MASTER-space (no platformLatencyMs).
-  // This keeps getCurrentPosition() in the same coordinate space as
-  // getEstimatedMasterPosition() so the drift loop compares apples to apples.
-  // platformLatencyMs is ONLY applied to the node.start() offset so the audio
-  // hardware output aligns with the master timeline despite the OS buffer delay.
+  // Apply manual offset and platform latency compensation.
+  // playStartPos is in MASTER-space (no platformLatencyMs) so getCurrentPosition()
+  // stays in the same coordinate space as getEstimatedMasterPosition().
   const masterSpacePos = rawPosition + (manualOffsetMs / 1000);
-  const nodeStartPos   = masterSpacePos + (platformLatencyMs / 1000);
-  const clamped        = Math.max(0, Math.min(nodeStartPos, audioDuration - 0.1));
+  const seekPos        = masterSpacePos + (platformLatencyMs / 1000);
+  const clamped        = Math.max(0, Math.min(seekPos, audioDuration - 0.1));
   const clampedMaster  = Math.max(0, Math.min(masterSpacePos, audioDuration - 0.1));
 
-  const node = audioCtx.createBufferSource();
-  node.buffer = audioBuffer;
-  node.connect(audioCtx.destination);
-  node.start(0, clamped);  // starts ahead in file by platformLatencyMs
+  // Seek the HTMLAudioElement to the target position.
+  // HTMLAudioElement.currentTime seek is accurate to ~10ms for MP3 files.
+  audioElement.currentTime = clamped;
 
-  node.onended = () => {
-    if (sourceNode === node) {
-      sourceNode = null;
-      isPlaying  = false;
-      albumArt.classList.remove('playing');
-      if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
-      if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
-      driftOutOfRangeCount = 0;
-      updatePlayPauseBtn();
-      if (!masterIsPlaying) setSyncStatus('synced', 'Show ended');
+  // Record wall-clock start time BEFORE play() so position tracking is
+  // correct from the moment the seek completes, even if play() is async.
+  playStartWallTime = Date.now();
+  playStartPos      = clampedMaster;
+  isPlaying         = true;
 
-      // Keep the AudioContext and Service Worker alive after the track ends.
-      // On Android, when the last AudioBufferSourceNode stops, Chrome detects
-      // the audio session as ended and suspends the AudioContext. Once suspended
-      // with no drift loop running, Android terminates the SW within 30 seconds.
-      //
-      // Fix: restart the silent keepalive node (keeps the audio session alive)
-      // and start a lightweight post-show polling loop that sends a server
-      // resync every 20 seconds. This keeps the SW active and ensures the device
-      // snaps back into sync immediately when the master player seeks or replays.
-      startSilentKeepalive();
-      startPostShowPolling();
-    }
+  // Resume AudioContext if needed, then play.
+  const doPlay = () => {
+    if (!audioElement) return;
+    audioElement.play().catch((e) => {
+      // Autoplay blocked — set pendingPlaybackPos so the statechange listener
+      // retries when the user next interacts with the page.
+      console.warn('[Cinewav] audioElement.play() blocked:', e);
+      isPlaying = false;
+      pendingPlaybackPos = rawPosition;
+    });
   };
 
-  sourceNode        = node;
-  playStartWallTime = Date.now();  // wall clock — immune to AudioContext suspension
-  playStartPos      = clampedMaster;  // master-space: no platformLatencyMs
-  isPlaying         = true;
+  if (audioCtx.state === 'running') {
+    doPlay();
+  } else {
+    // Context not yet running — resume first, then play.
+    audioCtx.resume().then(doPlay).catch(doPlay);
+  }
 
   startSilentKeepalive();
   albumArt.classList.add('playing');
@@ -767,15 +834,12 @@ function startPlayback(rawPosition: number): void {
 }
 
 function stopPlayback() {
-  const node = sourceNode;
-  sourceNode = null;
-  if (node) {
-    try { node.stop(); } catch { /* already stopped */ }
-    node.disconnect();
+  if (audioElement) {
+    audioElement.pause();
   }
   if (uiInterval)    { clearInterval(uiInterval);    uiInterval    = null; }
   if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
-  driftOutOfRangeCount = 0; // reset so partial counts don't accumulate across seeks
+  driftOutOfRangeCount = 0;
   isPlaying = false;
   albumArt.classList.remove('playing');
   updatePlayPauseBtn();
