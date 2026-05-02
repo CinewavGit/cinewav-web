@@ -514,9 +514,17 @@ async function initAudio(arrayBuffer: ArrayBuffer) {
     audioMediaSource = null;
   }
 
-  // Create a Blob URL from the ArrayBuffer. The browser streams the MP3 from
-  // this URL, decoding only the frames it needs — no 1.3 GB PCM allocation.
-  const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+  // Create a Blob URL from the ArrayBuffer. The browser streams the audio from
+  // this URL, decoding only the frames it needs — no large PCM allocation.
+  // Derive MIME type from the stored filename so HE-AAC v2 (.m4a/.aac) files
+  // are served with the correct type. Browsers are lenient but being precise
+  // avoids edge cases on strict iOS Safari versions.
+  const storedFilename = trackName.textContent || '';
+  const ext = storedFilename.split('.').pop()?.toLowerCase() || '';
+  const mimeType = (ext === 'm4a' || ext === 'aac') ? 'audio/mp4'
+                 : (ext === 'ogg') ? 'audio/ogg'
+                 : 'audio/mpeg'; // default: mp3
+  const blob = new Blob([arrayBuffer], { type: mimeType });
   audioBlobUrl = URL.createObjectURL(blob);
 
   // Create or reuse the HTMLAudioElement.
