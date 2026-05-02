@@ -153,9 +153,20 @@ function connectWebSocket() {
     copyUrlBtn.disabled = false;
     generateQR(audienceUrl, showId);
 
-    // If video is already loaded, broadcast its state
+    // If video is already loaded, broadcast its current state so audience
+    // devices that were already connected get the correct play/pause position
+    // after a master WS reconnect (e.g. after a Cloudflare DO restart).
     if (videoPlayer.readyState >= 1) {
       broadcastLoad();
+      // Re-broadcast current play/pause state so devices don't get stuck
+      // in 'waiting' after a reconnect when the show is already in progress.
+      setTimeout(() => {
+        if (videoPlayer.paused) {
+          broadcastPause(videoPlayer.currentTime);
+        } else {
+          broadcastPlay(videoPlayer.currentTime);
+        }
+      }, 200);
       updateTransportEnabled(true);
     }
   };
@@ -337,7 +348,12 @@ videoPlayer.addEventListener('pause', () => {
   statState.textContent = videoPlayer.ended ? 'ENDED' : 'PAUSED';
   stopUILoop();
   updateUI();
-
+  // CRITICAL: cancel any pending broadcastPlay throttle before broadcasting pause.
+  // The 'play' event handler queues broadcastPlay() on a 50ms timer to avoid
+  // double-firing on seek+play sequences. If the user presses Pause within that
+  // 50ms window, the pending broadcastPlay fires AFTER broadcastPause, overriding
+  // it on the server and restarting all audience devices.
+  if (broadcastThrottle) { clearTimeout(broadcastThrottle); broadcastThrottle = null; }
   if (!isSeeking) {
     broadcastPause();
   }

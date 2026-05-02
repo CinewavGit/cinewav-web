@@ -90,6 +90,7 @@ let keepaliveNode:   AudioBufferSourceNode | null = null; // FIX 3: silent keepa
 let androidKeepalive: HTMLAudioElement | null = null;        // Android AudioManager keepalive
 let androidKeepaliveSource: MediaElementAudioSourceNode | null = null; // createMediaElementSource bridge
 let isPlaying         = false;
+let locallyPaused     = false; // true when user has manually paused on their own device
 let playStartWallTime = 0;  // Date.now() when playback started (wall clock, not audio clock)
 let playStartPos      = 0;  // audio position (seconds) when playback started
 let audioDuration    = 0;
@@ -1106,13 +1107,14 @@ function updatePlayPauseBtn() {
 
 playPauseBtn.addEventListener('click', () => {
   if (!audioBuffer) return;
-
   if (isPlaying) {
     // Pausing locally is always allowed — it does not depend on the connection.
+    locallyPaused = true;  // suppress incoming play commands from the server
     stopPlayback();
     pendingPlaybackPos = null;
     setSyncStatus('synced', 'Paused locally');
   } else {
+    locallyPaused = false;  // clear local pause — rejoin the master stream
     // Starting playback requires a live connection so we get the authoritative
     // position from the server. Never start from a stale local estimate.
     if (!swConnected) {
@@ -1152,6 +1154,13 @@ function handleShowCommand(cmd: ShowCommand) {
       masterIsPlaying = true;
       pendingPlaybackPos = null;
       if (cmd.audioFile) trackName.textContent = cmd.audioFile;
+      // If the user has manually paused on their device, do not restart playback.
+      // locallyPaused is cleared when they tap Play again, at which point a
+      // sw_hard_resync delivers the current master position and restarts here.
+      if (locallyPaused) {
+        setSyncStatus('synced', 'Paused locally');
+        break;
+      }
       ensureAudioContext();
       if (audioCtx && audioCtx.state === 'running') {
         // AudioContext is already running — start immediately.
@@ -1179,12 +1188,18 @@ function handleShowCommand(cmd: ShowCommand) {
     }
     case 'pause': {
       masterIsPlaying = false;
+      // Master paused — clear locallyPaused so when master resumes,
+      // the device rejoins automatically without requiring a manual tap.
+      locallyPaused = false;
       stopPlayback();
       playStartPos = cmd.position;
       setSyncStatus('synced', 'Paused');
       break;
     }
     case 'seek': {
+      // A seek from the master overrides any local pause — the user expects
+      // the device to follow the master's new position.
+      locallyPaused = false;
       stopPlayback();
       pendingPlaybackPos = null;
       playStartPos = cmd.position;
