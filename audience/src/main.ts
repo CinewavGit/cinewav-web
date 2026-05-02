@@ -867,6 +867,10 @@ function startPlayback(rawPosition: number): void {
   startUILoop();
   startDriftLoop();
   updateMediaSession();
+  // Set the initial lock-screen scrubber position once at playback start.
+  // We defer this by one tick so getCurrentPosition() reflects the
+  // just-set playStartWallTime rather than the previous stale value.
+  setTimeout(setPositionStateOnce, 50);
 }
 
 function stopPlayback() {
@@ -891,9 +895,13 @@ function startUILoop() {
     const clamped = Math.min(pos, audioDuration);
     pCurrentTime.textContent = formatTime(clamped);
     if (audioDuration > 0) seekFill.style.width = `${(clamped / audioDuration) * 100}%`;
-    // Update MediaSession position state every 250ms so the OS lock-screen
-    // widget shows the correct playhead and Samsung sees an active session.
-    updateMediaSession();
+    // NOTE: updateMediaSession() is intentionally NOT called here.
+    // Calling setPositionState() every 250ms causes Oppo ColorOS (and some
+    // other OEM Android builds) to ring the Chrome 'Playing media' notification
+    // channel bell on every update — once per second. The OS treats each
+    // notification update as a new alert.
+    // MediaSession state is updated only on actual transitions (play/pause/seek)
+    // via the explicit updateMediaSession() calls in startPlayback/stopPlayback.
   }, 250);
 }
 
@@ -1107,18 +1115,36 @@ function updateMediaSession() {
   if (!('mediaSession' in navigator)) return;
   navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
 
-  // Update position state so the OS lock-screen media widget shows the
-  // correct playhead position. This also signals to Samsung's battery manager
-  // that the media session is actively progressing.
-  if (isPlaying && audioDuration > 0) {
-    try {
-      navigator.mediaSession.setPositionState({
-        duration:     audioDuration,
-        position:     Math.min(getCurrentPosition(), audioDuration),
-        playbackRate: 1,
-      });
-    } catch { /* setPositionState not supported on all browsers */ }
-  }
+  // NOTE: setPositionState() is intentionally NOT called here.
+  //
+  // On Oppo ColorOS and other OEM Android builds, Chrome's 'Playing media'
+  // notification channel has its sound set to the default notification tone.
+  // Calling setPositionState() causes Chrome to update the notification, which
+  // triggers the OS to ring the bell on every update. When called every 250ms
+  // from the UI loop this produced a constant bell sound during playback.
+  //
+  // setPositionState() is only called in setPositionStateOnce() below, which
+  // is invoked once at the moment playback starts (so the lock-screen scrubber
+  // shows the correct initial position) and on seek. The scrubber will not
+  // advance in real-time, but for a cinema sync app this is acceptable —
+  // the audience does not need to seek.
+}
+
+/**
+ * Call setPositionState() exactly once at playback start or on seek.
+ * This gives the OS lock-screen widget a correct initial position without
+ * triggering repeated notification sounds from continuous updates.
+ */
+function setPositionStateOnce() {
+  if (!('mediaSession' in navigator)) return;
+  if (!isPlaying || audioDuration <= 0) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration:     audioDuration,
+      position:     Math.min(getCurrentPosition(), audioDuration),
+      playbackRate: audioElement?.playbackRate ?? 1,
+    });
+  } catch { /* setPositionState not supported on all browsers */ }
 }
 
 // ── Play/Pause Button ─────────────────────────────────────────────────────────
