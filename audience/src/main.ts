@@ -630,13 +630,12 @@ function startSilentKeepalive() {
   node.start(0);
   keepaliveNode = node;
 
-  // ── HTMLAudioElement (Android only) ──────────────────────────────────────
-  // Detect Android: navigator.userAgent contains 'Android' and NOT 'iPhone'/'iPad'.
-  // We skip this on iOS to avoid the 1-second interruption bug.
-  const isAndroid = /Android/i.test(navigator.userAgent) && !/iPhone|iPad/i.test(navigator.userAgent);
-  if (isAndroid) {
-    startAndroidKeepalive();
-  }
+  // NOTE: The separate Android HTMLAudioElement keepalive (startAndroidKeepalive)
+  // is no longer needed. The main audioElement is now the primary audio source
+  // and is already connected to the AudioContext via createMediaElementSource().
+  // Android's AudioManager sees the show audio directly — no separate keepalive
+  // element is required. Running a second HTMLAudioElement caused Android to
+  // classify it as a notification sound, producing constant bell sounds.
 }
 
 /**
@@ -824,18 +823,29 @@ function startPlayback(rawPosition: number): void {
   isPlaying         = true;
 
   // 'playing' event: fired when audio actually starts producing output.
-  // Snap playStartWallTime to this moment to eliminate the decode latency gap.
-  // We use { once: true } so the handler auto-removes after the first fire.
+  // Two things happen here:
+  // 1. Snap playStartWallTime to eliminate the decode latency gap (iOS fix).
+  // 2. Resume the AudioContext if it is still suspended (Android screen-off fix).
+  //
+  // Android key insight: audioElement.play() can succeed even when the
+  // AudioContext is suspended (the element queues playback in the OS pipeline).
+  // But since audioElement is connected via createMediaElementSource(), its
+  // output is routed through the AudioContext graph. If the context is suspended,
+  // audio is silently discarded. Calling audioCtx.resume() from within the
+  // 'playing' event handler works WITHOUT a user gesture on Android because
+  // the browser grants AudioContext resume permission from within media event
+  // handlers (same as from a click handler).
   audioElement.addEventListener('playing', () => {
     if (!isPlaying) return; // guard: stopPlayback() may have been called
     // Recalculate the correct wall-clock anchor:
-    // at this moment, audioElement.currentTime is the actual playhead position.
-    // playStartPos is the master-space position we targeted.
-    // The difference between them (after accounting for platformLatencyMs) is
-    // the decode latency we need to absorb.
     const actualPos = audioElement!.currentTime - (platformLatencyMs / 1000);
-    const delta     = actualPos - clampedMaster; // how far ahead the element seeked
+    const delta     = actualPos - clampedMaster;
     playStartWallTime = Date.now() - (delta * 1000);
+    // Resume AudioContext from within the media event handler if still suspended.
+    // This is the correct gesture-free path on Android after a screen-off pause.
+    if (audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed') {
+      audioCtx.resume().catch(() => {});
+    }
   }, { once: true });
 
   // Resume AudioContext if needed, then play.
